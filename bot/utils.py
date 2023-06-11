@@ -43,7 +43,6 @@ def get_cycles(graph: Graph) -> Generator[list[int], None, None]:
         return list(reversed(cycle))
 
     def bfs_search(curr_index, prev_index):
-        print('bfs', prev_index, '->', curr_index)
         if visited[curr_index] == VisitStatus.Visited:
             return
         if visited[curr_index] == VisitStatus.InProcessing:
@@ -61,6 +60,18 @@ def get_cycles(graph: Graph) -> Generator[list[int], None, None]:
 
 
 if __name__ == '__main__':
+
+    # example
+    # 8 8
+    # 1 5
+    # 2 5
+    # 3 2
+    # 6 3
+    # 5 6
+    # 5 7
+    # 8 6
+    # 7 8
+
     n, m = map(int, input().split(' '))
     raw_edges: list[list[tuple]] = [[] for _ in range(n)]
     for _ in range(m):
