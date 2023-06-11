@@ -1,67 +1,75 @@
 from copy import deepcopy
-from typing import NewType
+from enum import IntEnum
+from typing import NewType, Generator
 from dataclasses import dataclass
+from collections import deque
 
 
 INF = 1000000000
-GraphMatrix = NewType('GraphMatrix', list[list[float]])
+
+
+class VisitStatus(IntEnum):
+    NotVisited = 0
+    InProcessing = 1
+    Visited = 2
+
+@dataclass
+class GraphNode:
+    index: int
+    # index, edge value
+    edges: list[tuple[int, float]]
 
 
 @dataclass
-class GraphResult:
-    graph_length: int
-    graph_volume: int
-    origin: GraphMatrix
-    distances: list[list[float]]
-    parents: list[list[int]]
+class Graph:
+    nodes: list[GraphNode]
 
-    def __str__(self):
-        def str_sq_list(sq_list: list[list[float]]) -> str:
-            s = ''
-            for line in sq_list:
-                s += ' '.join(f'{v:.1f}' for v in line) + '\n'
-            return s
-
-        return (
-            f'n: {self.graph_length}, n*n: {self.graph_volume}\n'
-            f'origin:\n' + str_sq_list(self.origin) +
-            f'distances:\n' + str_sq_list(self.distances) +
-            f'parents:\n' + str_sq_list(self.parents)
-        )
-
-    @classmethod
-    def from_graph(cls, graph: GraphMatrix):
-        graph_length = len(graph)
-        # matrix must be squared
-        assert all(graph_length == len(row) for row in graph)
-
-        return cls(
-            graph_length,
-            graph_length * graph_length,
-            deepcopy(graph),
-            deepcopy(graph),
-            [[-1] * graph_length for _ in range(graph_length)]
-        )
+    def __len__(self):
+        return len(self.nodes)
 
 
-def graph_distances(graph: GraphMatrix) -> GraphResult:
-    gr_res = GraphResult.from_graph(graph)
+def get_cycles(graph: Graph) -> Generator[list[int], None, None]:
+    visited: list[VisitStatus] = [VisitStatus.NotVisited] * len(graph)
+    visit_from: list[int] = [-1] * len(graph)
 
-    # floyd_warshall O(n^3)
-    for i in range(gr_res.graph_length):
-        for j in range(gr_res.graph_length):
-            for k in range(gr_res.graph_length):
-                gr_res.distances[i][j] = min(gr_res.distances[i][j], gr_res.distances[i][k] + gr_res.distances[k][j])
+    def restore_cycle(head_index, tail_index) -> list[int]:
+        cycle = deque()
+        curr_index = tail_index
+        # unwinding cycle
+        while curr_index != head_index:
+            cycle.append(curr_index)
+            curr_index = visit_from[curr_index]
+        cycle.append(head_index)
+        return list(reversed(cycle))
 
-    return gr_res
+    def bfs_search(curr_index, prev_index):
+        print('bfs', prev_index, '->', curr_index)
+        if visited[curr_index] == VisitStatus.Visited:
+            return
+        if visited[curr_index] == VisitStatus.InProcessing:
+            yield restore_cycle(curr_index, prev_index)
+            return
+
+        visited[curr_index] = VisitStatus.InProcessing
+        visit_from[curr_index] = prev_index
+        for next_index, edge_val in graph.nodes[curr_index].edges:
+            yield from bfs_search(next_index, curr_index)
+
+        visited[curr_index] = VisitStatus.NotVisited
+
+    yield from bfs_search(0, -1)
 
 
 if __name__ == '__main__':
-    graph = [
-        [0, 2, 3, INF, INF],
-        [2, 0, -5, INF, INF],
-        [3, INF, 0, -6, INF],
-        [INF, INF, INF, 0, -7],
-        [4, INF, INF, INF, 0],
-    ]
-    print(graph_distances(graph))
+    n, m = map(int, input().split(' '))
+    raw_edges: list[list[tuple]] = [[] for _ in range(n)]
+    for _ in range(m):
+        v1, v2 = map(int, input().split(' '))
+        raw_edges[v1 - 1].append((v2 - 1, 1))
+
+    graph = Graph([
+        GraphNode(index, e) for index, e in enumerate(raw_edges)
+    ])
+    print(graph)
+    for c in get_cycles(graph):
+        print(c)
