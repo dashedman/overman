@@ -1,6 +1,5 @@
-from copy import deepcopy
 from enum import IntEnum
-from typing import NewType, Generator, Sequence, Callable
+from typing import Generator, Sequence, Any
 from dataclasses import dataclass
 from collections import deque
 
@@ -13,22 +12,43 @@ class VisitStatus(IntEnum):
     InProcessing = 1
     Visited = 2
 
+
 @dataclass
 class GraphNode:
     index: int
     # index, edge value
     edges: list[tuple[int, float]]
+    value: Any
 
 
 @dataclass
 class Graph:
     nodes: list[GraphNode]
 
+    def __delitem__(self, key):
+        self.nodes.pop(key)
+        for node in self.nodes:
+            edges_to_del = []
+            edges_to_decrease = []
+            for index, (edge_tail, _) in enumerate(node.edges):
+                if edge_tail == key:
+                    edges_to_del.append(index)
+                elif edge_tail > key:
+                    edges_to_decrease.append(index)
+
+            for index in edges_to_decrease:
+                node.edges[index] = (node.edges[index][0] - 1, node.edges[index][1])
+            for index in edges_to_del:
+                node.edges.pop(index)
+
+            if node.index > key:
+                node.index -= 1
+
     def __len__(self):
         return len(self.nodes)
 
 
-def get_cycles(graph: Graph) -> Generator[Sequence[GraphNode], None, None]:
+def get_cycles(graph: Graph, start: int = 0, with_start: bool = False) -> Generator[Sequence[GraphNode], None, None]:
     visited: list[VisitStatus] = [VisitStatus.NotVisited] * len(graph)
     visit_from: list[int] = [-1] * len(graph)
 
@@ -46,7 +66,8 @@ def get_cycles(graph: Graph) -> Generator[Sequence[GraphNode], None, None]:
         if visited[curr_index] == VisitStatus.Visited:
             return
         if visited[curr_index] == VisitStatus.InProcessing:
-            yield restore_cycle(curr_index, prev_index)
+            if not with_start or curr_index == start:
+                yield restore_cycle(curr_index, prev_index)
             return
 
         visited[curr_index] = VisitStatus.InProcessing
@@ -59,7 +80,29 @@ def get_cycles(graph: Graph) -> Generator[Sequence[GraphNode], None, None]:
 
         visited[curr_index] = VisitStatus.NotVisited
 
-    yield from bfs_search(0, -1)
+    yield from bfs_search(start, -1)
+
+
+# TODO: get_cycles_with_pair
+# TODO: get_cycles_from_node_with_pair
+# TODO: filter graph from nodes without cycles with base coins
+def filter_from_noncycle_nodes(graph_inout: Graph, base_nodes: list[GraphNode]):
+    checked = [False] * len(graph_inout)
+    for cycle in get_cycles(graph_inout):
+        for base_node in base_nodes:
+            if base_node in cycle:
+                break
+        else:
+            continue
+
+        for index, val in enumerate(checked):
+            checked[index] = val or graph_inout.nodes[index] in cycle
+
+    del_count = 0
+    for index, good in enumerate(checked):
+        if not good:
+            del graph_inout[index - del_count]
+            del_count += 1
 
 
 if __name__ == '__main__':
