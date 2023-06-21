@@ -25,6 +25,9 @@ class GraphNode:
 class Graph:
     nodes: list[GraphNode]
 
+    def __getitem__(self, item):
+        return self.nodes[item]
+
     def __delitem__(self, key):
         self.nodes.pop(key)
         for node in self.nodes:
@@ -46,6 +49,9 @@ class Graph:
 
     def __len__(self):
         return len(self.nodes)
+
+    def __iter__(self):
+        return iter(self.nodes)
 
 
 def get_cycles(graph: Graph, start: int = 0, with_start: bool = False) -> Generator[Sequence[GraphNode], None, None]:
