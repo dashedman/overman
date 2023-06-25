@@ -11,3 +11,6 @@ class OrderBookPair:
 
     def __eq__(self, other):
         return self.price == other.price
+
+    def __lt__(self, other):
+        return self.price < other.price

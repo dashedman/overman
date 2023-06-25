@@ -3,6 +3,7 @@ import json
 import logging
 from collections import defaultdict, deque
 from functools import cached_property
+from pprint import pprint
 from typing import Literal
 
 import websockets
@@ -90,11 +91,18 @@ class Overman:
             f' symbol: {ob_symbol},'
             f' data: {self.order_book_by_ticker[ob_symbol]}'
         )
-        tmp = next(iter(self.order_book_by_ticker[ob_symbol]))
-        tmp_min = min(el.price for el in self.order_book_by_ticker[ob_symbol])
-        self.logger.info(f'Current value: {tmp}, min value: {tmp_min},'
-                         f' is equal: {tmp == tmp_min}')
-        self.update_graph(self.tickers_to_pairs[ob_symbol], tmp.price)
+        if self.order_book_by_ticker[ob_symbol]:
+            min_pair = min(self.order_book_by_ticker[ob_symbol])
+            self.update_graph(self.tickers_to_pairs[ob_symbol], min_pair.price)
+            profit = self.check_profit()
+            if profit:
+                profit_koef, cycle = profit
+                self.logger.info('Profit: %s, cycle: %s', profit_koef, cycle)
+
+                next_cycle = cycle.copy()
+                next_cycle.rotate(-1)
+                for index, ((node, edge), (next_node, _)) in enumerate(zip(cycle, next_cycle), start=1):
+                    print(index, node.value, edge.val, next_node.value)
 
     def run(self):
         asyncio.run(self.serve())
@@ -104,6 +112,9 @@ class Overman:
         self.logger.info('Loading graph')
         pairs = self.load_graph()
         self.logger.info('Loaded %s pairs.', len(pairs))
+        for base_coin, quote_coin in pairs:
+            # need print, not logger
+            print(base_coin, quote_coin, sep='>')
         self.tickers_to_pairs = {
             base_coin + quote_coin: (base_coin, quote_coin)
             for base_coin, quote_coin in pairs
@@ -127,7 +138,7 @@ class Overman:
         # trade if graph gave a signal
 
     async def monitor_socket(self, subs: list[str]):
-        url = "wss://stream-testnet.bybit.com/v5/public/spot"
+        url = "wss://stream.bybit.com/v5/public/spot"
         async for sock in websockets.connect(url):
             try:
                 if subs:
@@ -141,11 +152,15 @@ class Overman:
                         orderbook_type = orderbook.get('type')
                         if orderbook_type:
                             self.handle_raw_orderbook(orderbook)
+                        else:
+                            pprint(orderbook)
                     except Exception as e:
-                        print(e)
+                        self.logger.error(
+                            'Catch error while monitoring socket:\n',
+                            exc_info=e)
                         break
-            except websockets.ConnectionClosed:
-                ...
+            except websockets.ConnectionClosed as e:
+                self.logger.error('websocket error', exc_info=e)
 
     def update_graph(
             self,
@@ -157,12 +172,13 @@ class Overman:
         base_node = self.graph.get_node_for_coin(coins_pair[0])
         quote_node_index = self.graph.get_index_for_coin_name(coins_pair[1])
         for edge in base_node.edges:
-            quote_index, pair_value = edge
-            if quote_index == quote_node_index:
-                pair_value.val = new_value * (1 - fee)
+            if edge.next_node_index == quote_node_index:
+                edge.val = new_value * (1 - fee)
                 break
 
-    def check_profit(self) -> deque[tuple[GraphNode, Edge]] | None:
+    def check_profit(
+            self,
+    ) -> tuple[float, deque[tuple[GraphNode, Edge]]] | None:
         for pivot_coin_index in self.pivot_indexes:
             for cycle in self.graph.get_cycles(
                     start=pivot_coin_index,
@@ -172,7 +188,7 @@ class Overman:
                 for _, edge in cycle:
                     profit *= edge.val
                 if profit > 1:
-                    return cycle
+                    return profit, cycle
         return None
 
     def prepare_sub(self, subs_chunk: list[str]):
@@ -215,8 +231,8 @@ class Overman:
         self.graph.filter_from_noncycle_nodes(pivot_nodes)
 
         filtered_pairs = [
-            (node.value, self.graph[edge_index].value)
+            (node.value, self.graph[edge.next_node_index].value)
             for node in self.graph
-            for edge_index, _ in node.edges
+            for edge in node.edges
         ]
         return filtered_pairs

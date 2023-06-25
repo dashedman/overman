@@ -26,6 +26,9 @@ class GraphNode:
     edges: list[Edge]
     value: Any
 
+    def __eq__(self, other: 'GraphNode'):
+        return self.value == other.value
+
 
 @dataclass
 class Graph:
@@ -130,14 +133,15 @@ class Graph:
     def filter_from_noncycle_nodes(self, base_nodes: list[GraphNode]):
         checked = [False] * len(self)
         for cycle in self.get_cycles():
+            cycle_nodes = [cycle_node for cycle_node, _ in cycle]
             for base_node in base_nodes:
-                if base_node in cycle:
+                if base_node in cycle_nodes:
                     break
             else:
                 continue
 
             for index, val in enumerate(checked):
-                checked[index] = val or self.nodes[index] in cycle
+                checked[index] = val or self.nodes[index] in cycle_nodes
 
         del_count = 0
         for index, good in enumerate(checked):
