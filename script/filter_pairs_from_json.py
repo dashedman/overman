@@ -1,7 +1,7 @@
 import json
 from collections import defaultdict
 
-from bot.utils import Graph, GraphNode, get_cycles, filter_from_noncycle_nodes
+from bot.graph import Graph, GraphNode
 
 
 def main():
@@ -32,7 +32,7 @@ def main():
     base_nodes = [node for node in node_list if node.value in start_coins]
 
     print('before filter', len(graph))
-    filter_from_noncycle_nodes(graph, base_nodes)
+    graph.filter_from_noncycle_nodes(base_nodes)
     print('after filter', len(graph))
 
     counter = 0
@@ -43,7 +43,7 @@ def main():
     print(counter)
 
     counter = 0
-    for c in get_cycles(graph):
+    for c in graph.get_cycles():
         print(c)
         counter += 1
     print(counter)

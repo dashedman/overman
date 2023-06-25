@@ -53,8 +53,9 @@ async def main(tickers: list[str]):
         all_subs.append(sub_chunk)
 
     tasks = [
-        asyncio.create_task(
-            monitor_socket(numb, ch)) for numb, ch in enumerate(all_subs)]
+        asyncio.create_task(monitor_socket(numb, ch))
+        for numb, ch in enumerate(all_subs)
+    ]
     await asyncio.gather(*tasks)
 
 if __name__ == '__main__':
