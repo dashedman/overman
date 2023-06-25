@@ -14,16 +14,23 @@ class VisitStatus(IntEnum):
 
 
 @dataclass
+class PairValue:
+    val: float = 1.0
+
+
+@dataclass
 class GraphNode:
     index: int
     # index, edge value
-    edges: list[tuple[int, float]]
+    edges: list[tuple[int, PairValue]]
     value: Any
 
 
 @dataclass
 class Graph:
     nodes: list[GraphNode]
+    __names_to_index: dict[str, int] = None
+    __need_update: bool = True
 
     def __getitem__(self, item):
         return self.nodes[item]
@@ -47,49 +54,74 @@ class Graph:
             if node.index > key:
                 node.index -= 1
 
+        self.__need_update = True
+
     def __len__(self):
         return len(self.nodes)
 
     def __iter__(self):
         return iter(self.nodes)
 
+    def get_index_for_coin_name(self, coin: str):
+        if self.__need_update:
+            self.__names_to_index = {}
+            for index, node in enumerate(self):
+                self.__names_to_index[node.value] = index
+            self.__need_update = False
+
+        return self.__names_to_index[coin]
+
+    def get_node_for_coin(self, coin: str):
+        return self.nodes[self.get_index_for_coin_name(coin)]
+
+    def restore_cycle(
+            self,
+            head_index,
+            tail_index,
+            visit_from: list[int],
+            value_from: list[PairValue],
+            last_edge_val: PairValue,
+    ) -> deque[tuple[GraphNode, PairValue]]:
+        cycle = deque()
+        curr_index = tail_index
+        curr_edge_val = last_edge_val
+        # unwinding cycle
+        while curr_index != head_index:
+            cycle.appendleft((self.nodes[curr_index], curr_edge_val))
+            curr_edge_val = value_from[curr_index]
+            curr_index = visit_from[curr_index]
+        cycle.appendleft((self.nodes[head_index], curr_edge_val))
+        return cycle
+
     def get_cycles(
             self,
             start: int = 0,
             with_start: bool = False,
-    ) -> Generator[Sequence[GraphNode], None, None]:
+    ) -> Generator[deque[tuple[GraphNode, PairValue]], None, None]:
         visited: list[VisitStatus] = [VisitStatus.NotVisited] * len(self)
         visit_from: list[int] = [-1] * len(self)
+        value_from: list[PairValue | None] = [None] * len(self)
 
-        def restore_cycle(head_index, tail_index) -> Sequence[GraphNode]:
-            cycle = deque()
-            curr_index = tail_index
-            # unwinding cycle
-            while curr_index != head_index:
-                cycle.appendleft(self.nodes[curr_index])
-                curr_index = visit_from[curr_index]
-            cycle.appendleft(self.nodes[head_index])
-            return cycle
-
-        def bfs_search(curr_index, prev_index):
+        def bfs_search(curr_index, prev_index, prev_edge_val):
             if visited[curr_index] == VisitStatus.Visited:
                 return
             if visited[curr_index] == VisitStatus.InProcessing:
                 if not with_start or curr_index == start:
-                    yield restore_cycle(curr_index, prev_index)
+                    yield self.restore_cycle(curr_index, prev_index, visit_from, value_from, prev_edge_val)
                 return
 
             visited[curr_index] = VisitStatus.InProcessing
             visit_from[curr_index] = prev_index
+            value_from[curr_index] = prev_edge_val
             for next_index, edge_val in self.nodes[curr_index].edges:
                 if next_index == prev_index:
-                    # detect cycle with length == 2
+                    # detect cycle with length equals to 2
                     continue
-                yield from bfs_search(next_index, curr_index)
+                yield from bfs_search(next_index, curr_index, edge_val)
 
             visited[curr_index] = VisitStatus.NotVisited
 
-        yield from bfs_search(start, -1)
+        yield from bfs_search(start, -1, None)
 
     # TODO: get_cycles_with_pair
     # TODO: get_cycles_from_node_with_pair
@@ -117,23 +149,25 @@ if __name__ == '__main__':
 
     # example
     # 8 8
-    # 0 4
-    # 1 4
-    # 2 1
-    # 5 2
-    # 4 5
-    # 4 6
-    # 7 5
-    # 6 7
+    # 0 4 1
+    # 1 4 2
+    # 2 1 3
+    # 5 2 4
+    # 4 5 5
+    # 4 6 6
+    # 7 5 7
+    # 6 7 8
 
     n, m = map(int, input().split(' '))
     raw_edges: list[list[tuple]] = [[] for _ in range(n)]
     for _ in range(m):
-        v1, v2 = map(int, input().split(' '))
-        raw_edges[v1].append((v2, 1))
+        v1, v2, val = map(int, input().split(' '))
+        raw_edges[v1].append((v2, PairValue(val)))
 
     test_graph = Graph([
-        GraphNode(index, e) for index, e in enumerate(raw_edges)
+        GraphNode(index, e, str(index)) for index, e in enumerate(raw_edges)
     ])
     for c in test_graph.get_cycles():
-        print(c)
+        for node, pair_val in c:
+            print(node.value, pair_val)
+        print()
