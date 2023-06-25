@@ -11,7 +11,7 @@ from bot import utils
 from bot.graph import Graph, GraphNode, PairValue
 
 
-logging.
+# logging.
 
 
 class Overman:
@@ -95,7 +95,7 @@ class Overman:
             for cycle in self.graph.get_cycles(start=pivot_coin_index, with_start=True):
                 profit = 1
                 for _, pair_val in cycle:
-                    profit *= pair_val
+                    profit *= pair_val.val
                 if profit > 1:
                     return cycle
         return None

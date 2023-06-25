@@ -1,8 +1,10 @@
 import asyncio
 import json
+from collections import defaultdict
 from itertools import islice
 
 import websockets
+import dto
 
 
 def chunk(raw_list, size=10):
@@ -18,7 +20,55 @@ def prepare_sub(subs_chunk: list[str]):
     }
 
 
-async def monitor_socket(chunk_numb: int, subs: list[str]):
+order_book_by_ticker: dict[str, set['dto.OrderBookPair']] = defaultdict(set)
+
+
+def handle_raw_orderbook(
+        raw_orderbook: dict[str, str | dict[str, str | list[str]]]):
+    """
+    Example snapshot:
+
+    {'topic': 'orderbook.50.DYDXUSDT', 'ts': 1687687095565, 'type': 'snapshot',
+     'data': {'s': 'DYDXUSDT', 'b': [['2.001', '360.697'], ['1.971', '292.256'],
+      ['1.97', '453.245'], ['1.968', '672.694'], ['1.967', '690.698'],
+       ['1.966', '743.749'], ['1.963', '261.32'], ['1.962', '559.267']],
+        'a': [['2.003', '506.542'], ['2.033', '574.77'], ['2.034', '424.14'],
+         ['2.035', '292.429'], ['2.036', '627.188'], ['2.037', '640.978'],
+          ['2.038', '399.721'], ['2.039', '732.748'], ['2.041', '631.048'],
+           ['2.042', '669.269'], ['2.043', '517.712'], ['2.171', '30.765'],
+            ['2.172', '38.137'], ['2.173', '35.01'], ['2.174', '58.356']],
+             'u': 19047, 'seq': 499518832}}
+
+    Example delta:
+
+    {'topic': 'orderbook.50.DYDXUSDT', 'ts': 1687687108145, 'type': 'delta',
+     'data': {'s': 'DYDXUSDT', 'b': [['1.963', '261.32'], ['1.965', '0'],
+      ['1.969', '0']], 'a': [['2.033', '554.77']], 'u': 19058, 'seq': 499518911}
+      }
+    """
+    ob_type = raw_orderbook['type']
+    ob_symbol: str = raw_orderbook['data']['s']
+    raw_ask_data = raw_orderbook['data']['a']
+    prepared_ask_data: set['dto.OrderBookPair'] = {
+        dto.OrderBookPair(float(orderbook_el[0]), float(orderbook_el[1]))
+        for orderbook_el in raw_ask_data
+    }
+    if ob_type == 'snapshot':
+        order_book_by_ticker[ob_symbol] = prepared_ask_data
+    else:
+        for p_ask in prepared_ask_data:
+            if p_ask in order_book_by_ticker[ob_symbol]:
+                order_book_by_ticker[ob_symbol].remove(p_ask)
+                if p_ask.count != 0:
+                    order_book_by_ticker[ob_symbol].add(p_ask)
+            else:
+                order_book_by_ticker[ob_symbol].add(p_ask)
+
+    print(f'{ob_type},'
+          f' symbol: {ob_symbol}, data: {order_book_by_ticker[ob_symbol]}')
+
+
+async def monitor_socket(subs: list[str]):
     url = "wss://stream-testnet.bybit.com/v5/public/spot"
     async for sock in websockets.connect(url):
         try:
@@ -28,9 +78,11 @@ async def monitor_socket(chunk_numb: int, subs: list[str]):
                 await sock.send(pairs)
             while True:
                 try:
-                    order_book_raw: str = await sock.recv()
-                    order_book: dict = json.loads(order_book_raw)
-                    print(f'{chunk_numb}: {order_book}')
+                    orderbook_raw: str = await sock.recv()
+                    orderbook: dict = json.loads(orderbook_raw)
+                    orderbook_type = orderbook.get('type')
+                    if orderbook_type:
+                        handle_raw_orderbook(orderbook)
                 except Exception as e:
                     print(e)
                     break
