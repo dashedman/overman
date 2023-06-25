@@ -1,13 +1,21 @@
 import asyncio
 import json
 from collections import defaultdict
-from typing import Iterable
+from typing import Iterable, Literal
 
+import websockets
+
+from bot import utils
 from bot.graph import Graph, GraphNode
 
 
 class Overman:
     graph: Graph
+
+    def __init__(self, tickers: list[str], depth: Literal[1, 50], prefix: str):
+        self.tickers = tickers
+        self.depth = depth
+        self.prefix = prefix
 
     def run(self):
         asyncio.run(self.serve())
@@ -15,10 +23,49 @@ class Overman:
     async def serve(self):
         # init graph
         self.load_graph()
-        # starting to listen socket
 
+        # starting to listen sockets
+        ticker_chunks = utils.chunk(self.tickers)
+        all_subs = []
+        for ticker_ch in ticker_chunks:
+            sub_chunk = []
+            for tick in ticker_ch:
+                sub_chunk.append(f"{self.prefix}.{self.depth}.{tick}")
+            all_subs.append(sub_chunk)
+
+        tasks = [
+            asyncio.create_task(self.monitor_socket(numb, ch))
+            for numb, ch in enumerate(all_subs)
+        ]
+        await asyncio.gather(*tasks)
         # edit graph
         # trade if graph gave a signal
+
+    async def monitor_socket(self, chunk_numb: int, subs: list[str]):
+        url = "wss://stream-testnet.bybit.com/v5/public/spot"
+        async for sock in websockets.connect(url):
+            try:
+                if subs:
+                    sub = self.prepare_sub(subs)
+                    pairs = json.dumps(sub)
+                    await sock.send(pairs)
+                while True:
+                    try:
+                        order_book_raw: str = await sock.recv()
+                        order_book: dict = json.loads(order_book_raw)
+                        print(f'{chunk_numb}: {order_book}')
+                    except Exception as e:
+                        print(e)
+                        break
+            except websockets.ConnectionClosed:
+                ...
+
+    def prepare_sub(self, subs_chunk: list[str]):
+        return {
+            "req_id": "test",
+            "op": "subscribe",
+            "args": subs_chunk
+        }
 
     def load_graph(self, start_coins: Iterable[str] = ('BTC', 'ETH', 'USDT', 'USDC')):
         # Read pairs
