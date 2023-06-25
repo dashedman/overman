@@ -60,6 +60,9 @@ class Overman:
             except websockets.ConnectionClosed:
                 ...
 
+    def update_graph(self):
+        ...
+
     def prepare_sub(self, subs_chunk: list[str]):
         return {
             "req_id": "test",
