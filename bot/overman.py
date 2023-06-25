@@ -3,12 +3,12 @@ import json
 import logging
 from collections import defaultdict, deque
 from functools import cached_property
-from typing import Iterable, Literal
+from typing import Literal
 
 import websockets
 
 from bot import utils
-from bot.graph import Graph, GraphNode, PairValue
+from bot.graph import Graph, GraphNode, Edge
 
 
 # logging.
@@ -90,12 +90,12 @@ class Overman:
                 pair_value.val = new_value * (1 - fee)
                 break
 
-    def check_profit(self) -> deque[tuple[GraphNode, PairValue]] | None:
+    def check_profit(self) -> deque[tuple[GraphNode, Edge]] | None:
         for pivot_coin_index in self.pivot_indexes:
             for cycle in self.graph.get_cycles(start=pivot_coin_index, with_start=True):
                 profit = 1
-                for _, pair_val in cycle:
-                    profit *= pair_val.val
+                for _, edge in cycle:
+                    profit *= edge.val
                 if profit > 1:
                     return cycle
         return None
@@ -126,7 +126,7 @@ class Overman:
             edges = []
             for tail in base_coins[node_key]:
                 try:
-                    edges.append((node_keys.index(tail), PairValue()))
+                    edges.append(Edge(node_keys.index(tail), 0))
                 except ValueError:
                     continue
             node_list.append(GraphNode(index, edges=edges, value=node_key))
