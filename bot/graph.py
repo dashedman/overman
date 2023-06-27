@@ -1,8 +1,9 @@
 from enum import IntEnum
-from typing import Generator, Any, Callable, TypeVar
+from typing import Generator, Any, TypeVar, Iterable
 from dataclasses import dataclass, field
 from collections import deque
 
+from tqdm import tqdm
 
 INF = 1000000000
 
@@ -147,7 +148,15 @@ class Graph:
     def filter_from_noncycle_nodes(self, base_nodes: list[GraphNode]):
         checked = [False] * len(self)
         for base_node in base_nodes:
-            for cycle in self.get_cycles(start=base_node.index, with_start=True, max_length=5):
+            cycle_generator = tqdm(
+                self.get_cycles(start=base_node.index, with_start=True, max_length=5),
+                desc=base_node.value,
+                ascii=True,
+                unit=' cycles',
+            )
+            cycle_generator: Iterable[deque[tuple[GraphNode, Edge]]]
+
+            for cycle in cycle_generator:
                 for node, edge in cycle:
                     checked[node.index] = True
 
@@ -186,6 +195,6 @@ if __name__ == '__main__':
         GraphNode(index, e, str(index)) for index, e in enumerate(raw_edges)
     ])
     for c in test_graph.get_cycles():
-        for node, pair_val in c:
-            print(node.value, pair_val)
+        for cnode, pair_val in c:
+            print(cnode.value, pair_val)
         print()

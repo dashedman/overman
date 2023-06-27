@@ -1,6 +1,5 @@
 import asyncio
 import json
-import logging
 from collections import defaultdict, deque
 from functools import cached_property
 from pprint import pprint
@@ -9,12 +8,10 @@ from typing import Literal
 import requests
 import websockets
 
+import bot.logger
 from bot import utils
 from bot.graph import Graph, GraphNode, Edge
 import dto
-
-
-# logging.
 
 
 class Overman:
@@ -32,15 +29,15 @@ class Overman:
         self.pivot_coins = pivot_coins
         self.order_book_by_ticker: dict[str, set['dto.OrderBookPair']] \
             = defaultdict(set)
-        self.token="2neAiuYvAU61ZDXANAGAsiL4-iAExhsBXZxftpOeh_5" \
-                   "5i3Ysy2q2LEsEWU64mdzUOPusi34M_wGoSf7iNyEWJ6" \
-                   "1c9cBSu34minkkRmbD8qeAA2RniAeBpNiYB9J6i9Gjsx" \
-                   "UuhPw3BlrzazF6ghq4L-l3quUQN_RjW3ZkgQd2kJw=.d" \
-                   "WwmgZmsM8pLO2ZqXYviZA=="
+        self.token = (
+            "2neAiuYvAU61ZDXANAGAsiL4-iAExhsBXZxftpOeh_55i3Ysy2q2LEsEWU64mdzUOP"
+            "usi34M_wGoSf7iNyEWJ61c9cBSu34minkkRmbD8qeAA2RniAeBpNiYB9J6i9GjsxUu"
+            "hPw3BlrzazF6ghq4L-l3quUQN_RjW3ZkgQd2kJw=.dWwmgZmsM8pLO2ZqXYviZA=="
+        )
 
     @cached_property
     def logger(self):
-        return logging.getLogger('overman')
+        return bot.logger.getLogger('overman')
 
     @cached_property
     def pivot_indexes(self):
@@ -48,6 +45,71 @@ class Overman:
             self.graph.get_index_for_coin_name(coin)
             for coin in self.pivot_coins
         ]
+
+    @staticmethod
+    def prepare_sub(subs_chunk: list[str]):
+        return {
+            "id": "test",
+            "type": "subscribe",
+            "topic": f"/spotMarket/level2Depth5:{','.join(subs_chunk)}",
+            "response": True
+        }
+
+    def run(self):
+        asyncio.run(self.serve())
+
+    async def serve(self):
+        # init graph
+        self.logger.info('Loading graph')
+        pairs = await self.load_graph()
+        self.logger.info('Loaded %s pairs.', len(pairs))
+        self.tickers_to_pairs = {
+            base_coin + '-' + quote_coin: (base_coin, quote_coin)
+            for base_coin, quote_coin in pairs
+        }
+
+        # starting to listen sockets
+        ticker_chunks = utils.chunk(self.tickers_to_pairs.keys(), 10000)
+        all_subs = []
+        for ticker_ch in ticker_chunks:
+            sub_chunk = []
+            for tick in ticker_ch:
+                sub_chunk.append(f"{tick}")
+            all_subs.append(sub_chunk)
+
+        tasks = [
+            asyncio.create_task(self.monitor_socket(ch))
+            for ch in all_subs
+        ]
+        await asyncio.gather(*tasks)
+        # edit graph
+        # trade if graph gave a signal
+
+    async def monitor_socket(self, subs: list[str]):
+        url = f"wss://ws-api-spot.kucoin.com/?token={self.token}"
+        async for sock in websockets.connect(url):
+            try:
+                if subs:
+                    sub = self.prepare_sub(subs)
+                    pairs = json.dumps(sub)
+                    await sock.send(pairs)
+                while True:
+                    try:
+                        orderbook_raw: str = await sock.recv()
+                        orderbook: dict = json.loads(orderbook_raw)
+                        orderbook_type = orderbook.get('type')
+                        if orderbook_type:
+                            ...
+                            # self.handle_raw_orderbook(orderbook)
+                        else:
+                            pprint(orderbook)
+                    except Exception as e:
+                        self.logger.error(
+                            'Catch error while monitoring socket:\n',
+                            exc_info=e)
+                        break
+            except websockets.ConnectionClosed as e:
+                self.logger.error('websocket error', exc_info=e)
 
     def handle_raw_orderbook(
             self,
@@ -110,65 +172,6 @@ class Overman:
                 for index, ((node, edge), (next_node, _)) in enumerate(zip(cycle, next_cycle), start=1):
                     print(index, node.value, edge.val, next_node.value)
 
-    def run(self):
-        asyncio.run(self.serve())
-
-    async def serve(self):
-        # init graph
-        self.logger.info('Loading graph')
-        pairs = self.load_graph()
-        self.logger.info('Loaded %s pairs.', len(pairs))
-        for base_coin, quote_coin in pairs:
-            # need print, not logger
-            print(base_coin, quote_coin, sep='>')
-        self.tickers_to_pairs = {
-            base_coin + '-' + quote_coin: (base_coin, quote_coin)
-            for base_coin, quote_coin in pairs
-        }
-
-        # starting to listen sockets
-        ticker_chunks = utils.chunk(self.tickers_to_pairs.keys(), 10000)
-        all_subs = []
-        for ticker_ch in ticker_chunks:
-            sub_chunk = []
-            for tick in ticker_ch:
-                sub_chunk.append(f"{tick}")
-            all_subs.append(sub_chunk)
-
-        tasks = [
-            asyncio.create_task(self.monitor_socket(ch))
-            for ch in all_subs
-        ]
-        await asyncio.gather(*tasks)
-        # edit graph
-        # trade if graph gave a signal
-
-    async def monitor_socket(self, subs: list[str]):
-        url = f"wss://ws-api-spot.kucoin.com/?token={self.token}"
-        async for sock in websockets.connect(url):
-            try:
-                if subs:
-                    sub = self.prepare_sub(subs)
-                    pairs = json.dumps(sub)
-                    await sock.send(pairs)
-                while True:
-                    try:
-                        orderbook_raw: str = await sock.recv()
-                        orderbook: dict = json.loads(orderbook_raw)
-                        orderbook_type = orderbook.get('type')
-                        if orderbook_type:
-                            ...
-                            # self.handle_raw_orderbook(orderbook)
-                        else:
-                            pprint(orderbook)
-                    except Exception as e:
-                        self.logger.error(
-                            'Catch error while monitoring socket:\n',
-                            exc_info=e)
-                        break
-            except websockets.ConnectionClosed as e:
-                self.logger.error('websocket error', exc_info=e)
-
     def update_graph(
             self,
             coins_pair: tuple[str, str],
@@ -198,15 +201,7 @@ class Overman:
                     return profit, cycle
         return None
 
-    def prepare_sub(self, subs_chunk: list[str]):
-        return {
-            "id": "test",
-            "type": "subscribe",
-            "topic": f"/spotMarket/level2Depth5:{','.join(subs_chunk)}",
-            "response": True
-        }
-
-    def load_graph(self) -> list[tuple[str, str]]:
+    async def load_graph(self) -> list[tuple[str, str]]:
         # Read pairs
         url = "https://api.kucoin.com/api/v2/symbols"
         r = requests.get(url)
@@ -226,7 +221,7 @@ class Overman:
             inv_base_coins[pair['quoteCurrency']].add(pair['baseCurrency'])
 
         # build nodes from pairs
-        node_keys = list(base_coins.keys())
+        node_keys = list(set(base_coins.keys()) | set(inv_base_coins.keys()))
         node_list = []
         for index, node_key in enumerate(node_keys):
             edges = []
