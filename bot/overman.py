@@ -201,14 +201,19 @@ class Overman:
     def load_graph(self) -> list[tuple[str, str]]:
         # Read pairs
         with open('instruments-info.json', 'r') as f:
-            instr_info = json.load(fp=f)['result']['list']
+            instr_info = json.load(fp=f)['data']
 
         # Filter from test coins
-        base_coins: dict[str, list[str]] = defaultdict(list)
+        base_coins: dict[str, set[str]] = defaultdict(set)
+        inv_base_coins: dict[str, set[str]] = defaultdict(set)
         for pair in instr_info:
-            if 'TEST' in pair['baseCoin'] or 'TEST' in pair['quoteCoin']:
+            if 'TEST' in pair['baseCurrency'] or 'TEST' in pair['quoteCurrency']:
                 continue
-            base_coins[pair['baseCoin']].append(pair['quoteCoin'])
+
+            if pair['quoteCurrency'] in base_coins and pair['baseCurrency'] in inv_base_coins:
+                continue
+            base_coins[pair['baseCurrency']].add(pair['quoteCurrency'])
+            inv_base_coins[pair['quoteCurrency']].add(pair['baseCurrency'])
 
         # build nodes from pairs
         node_keys = list(base_coins.keys())
@@ -217,7 +222,12 @@ class Overman:
             edges = []
             for tail in base_coins[node_key]:
                 try:
-                    edges.append(Edge(node_keys.index(tail), 0))
+                    edges.append(Edge(node_keys.index(tail), 0, False))
+                except ValueError:
+                    continue
+            for tail in inv_base_coins[node_key]:
+                try:
+                    edges.append(Edge(node_keys.index(tail), 0, True))
                 except ValueError:
                     continue
             node_list.append(GraphNode(index, edges=edges, value=node_key))
@@ -234,5 +244,6 @@ class Overman:
             (node.value, self.graph[edge.next_node_index].value)
             for node in self.graph
             for edge in node.edges
+            if not edge.inversed
         ]
         return filtered_pairs

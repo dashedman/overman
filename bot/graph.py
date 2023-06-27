@@ -1,10 +1,14 @@
 from enum import IntEnum
-from typing import Generator, Any
-from dataclasses import dataclass
+from typing import Generator, Any, Callable, TypeVar
+from dataclasses import dataclass, field
 from collections import deque
 
 
 INF = 1000000000
+
+
+T = TypeVar('T')
+S = TypeVar('S')
 
 
 class VisitStatus(IntEnum):
@@ -16,7 +20,8 @@ class VisitStatus(IntEnum):
 @dataclass
 class Edge:
     next_node_index: int
-    val: float = 1.0
+    val: float = field(default=1.0)
+    inversed: bool = field(default=False)
 
 
 @dataclass
@@ -101,13 +106,17 @@ class Graph:
             self,
             start: int = 0,
             with_start: bool = False,
+            max_length: int = None,
+            prevent_short_cycles: bool = True,
     ) -> Generator[deque[tuple[GraphNode, Edge]], None, None]:
         visited: list[VisitStatus] = [VisitStatus.NotVisited] * len(self)
         visit_from: list[int] = [-1] * len(self)
         edge_from: list[Edge | None] = [None] * len(self)
 
-        def bfs_search(curr_index, prev_index, prev_edge):
+        def bfs_search(curr_index, prev_index, prev_edge, curr_depth):
             if visited[curr_index] == VisitStatus.Visited:
+                return
+            if with_start and max_length is not None and curr_depth > max_length:
                 return
             if visited[curr_index] == VisitStatus.InProcessing:
                 if not with_start or curr_index == start:
@@ -118,36 +127,40 @@ class Graph:
             visit_from[curr_index] = prev_index
             edge_from[curr_index] = prev_edge
             for next_edge in self.nodes[curr_index].edges:
-                if next_edge.next_node_index == prev_index:
+                if prevent_short_cycles and next_edge.next_node_index == prev_index:
                     # detect cycle with length equals to 2
                     continue
-                yield from bfs_search(next_edge.next_node_index, curr_index, next_edge)
+                yield from bfs_search(
+                    next_edge.next_node_index,
+                    curr_index,
+                    next_edge,
+                    curr_depth + 1,
+                )
 
             visited[curr_index] = VisitStatus.NotVisited
 
-        yield from bfs_search(start, -1, None)
+        yield from bfs_search(start, -1, None, 1)
 
     # TODO: get_cycles_with_pair
     # TODO: get_cycles_from_node_with_pair
     # TODO: filter graph from nodes without cycles with base coins
     def filter_from_noncycle_nodes(self, base_nodes: list[GraphNode]):
         checked = [False] * len(self)
-        for cycle in self.get_cycles():
-            cycle_nodes = [cycle_node for cycle_node, _ in cycle]
-            for base_node in base_nodes:
-                if base_node in cycle_nodes:
-                    break
-            else:
-                continue
-
-            for index, val in enumerate(checked):
-                checked[index] = val or self.nodes[index] in cycle_nodes
+        for base_node in base_nodes:
+            for cycle in self.get_cycles(start=base_node.index, with_start=True, max_length=5):
+                for node, edge in cycle:
+                    checked[node.index] = True
 
         del_count = 0
         for index, good in enumerate(checked):
             if not good:
                 del self[index - del_count]
                 del_count += 1
+
+    def print_pairs(self):
+        for node in self:
+            for edge in node.edges:
+                print(node.value, self[edge.next_node_index].value, sep='>')
 
 
 if __name__ == '__main__':
