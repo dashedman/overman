@@ -6,6 +6,7 @@ from functools import cached_property
 from pprint import pprint
 from typing import Literal
 
+import requests
 import websockets
 
 from bot import utils
@@ -31,6 +32,11 @@ class Overman:
         self.pivot_coins = pivot_coins
         self.order_book_by_ticker: dict[str, set['dto.OrderBookPair']] \
             = defaultdict(set)
+        self.token="2neAiuYvAU61ZDXANAGAsiL4-iAExhsBXZxftpOeh_5" \
+                   "5i3Ysy2q2LEsEWU64mdzUOPusi34M_wGoSf7iNyEWJ6" \
+                   "1c9cBSu34minkkRmbD8qeAA2RniAeBpNiYB9J6i9Gjsx" \
+                   "UuhPw3BlrzazF6ghq4L-l3quUQN_RjW3ZkgQd2kJw=.d" \
+                   "WwmgZmsM8pLO2ZqXYviZA=="
 
     @cached_property
     def logger(self):
@@ -116,17 +122,17 @@ class Overman:
             # need print, not logger
             print(base_coin, quote_coin, sep='>')
         self.tickers_to_pairs = {
-            base_coin + quote_coin: (base_coin, quote_coin)
+            base_coin + '-' + quote_coin: (base_coin, quote_coin)
             for base_coin, quote_coin in pairs
         }
 
         # starting to listen sockets
-        ticker_chunks = utils.chunk(self.tickers_to_pairs.keys())
+        ticker_chunks = utils.chunk(self.tickers_to_pairs.keys(), 10000)
         all_subs = []
         for ticker_ch in ticker_chunks:
             sub_chunk = []
             for tick in ticker_ch:
-                sub_chunk.append(f"{self.prefix}.{self.depth}.{tick}")
+                sub_chunk.append(f"{tick}")
             all_subs.append(sub_chunk)
 
         tasks = [
@@ -138,7 +144,7 @@ class Overman:
         # trade if graph gave a signal
 
     async def monitor_socket(self, subs: list[str]):
-        url = "wss://stream.bybit.com/v5/public/spot"
+        url = f"wss://ws-api-spot.kucoin.com/?token={self.token}"
         async for sock in websockets.connect(url):
             try:
                 if subs:
@@ -151,7 +157,8 @@ class Overman:
                         orderbook: dict = json.loads(orderbook_raw)
                         orderbook_type = orderbook.get('type')
                         if orderbook_type:
-                            self.handle_raw_orderbook(orderbook)
+                            ...
+                            # self.handle_raw_orderbook(orderbook)
                         else:
                             pprint(orderbook)
                     except Exception as e:
@@ -193,15 +200,18 @@ class Overman:
 
     def prepare_sub(self, subs_chunk: list[str]):
         return {
-            "req_id": "test",
-            "op": "subscribe",
-            "args": subs_chunk
+            "id": "test",
+            "type": "subscribe",
+            "topic": f"/spotMarket/level2Depth5:{','.join(subs_chunk)}",
+            "response": True
         }
 
     def load_graph(self) -> list[tuple[str, str]]:
         # Read pairs
-        with open('instruments-info.json', 'r') as f:
-            instr_info = json.load(fp=f)['data']
+        url = "https://api.kucoin.com/api/v2/symbols"
+        r = requests.get(url)
+
+        instr_info = r.json()['data']
 
         # Filter from test coins
         base_coins: dict[str, set[str]] = defaultdict(set)

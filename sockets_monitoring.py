@@ -12,11 +12,12 @@ def chunk(raw_list, size=10):
     return list(iter(lambda: tuple(islice(raw_list, size)), ()))
 
 
-def prepare_sub(subs_chunk: list[str]):
+def prepare_sub(subs_chunk: list[str]=None):
     return {
-        "req_id": "test",
-        "op": "subscribe",
-        "args": subs_chunk
+        "id": "test",
+        "type": "subscribe",
+        "topic": "/market/level2:BTC-USDT",
+        "response": True
     }
 
 
@@ -68,21 +69,22 @@ def handle_raw_orderbook(
           f' symbol: {ob_symbol}, data: {order_book_by_ticker[ob_symbol]}')
 
 
-async def monitor_socket(subs: list[str]):
-    url = "wss://stream-testnet.bybit.com/v5/public/spot"
+async def monitor_socket(subs: list[str]=None):
+    url = "wss://ws-api-spot.kucoin.com/?token=2neAiuYvAU61ZDXANAGAsiL4-iAExhsBXZxftpOeh_55i3Ysy2q2LEsEWU64mdzUOPusi34M_wGoSf7iNyEWJ61c9cBSu34minkkRmbD8qeAA2RniAeBpNiYB9J6i9GjsxUuhPw3BlrzazF6ghq4L-l3quUQN_RjW3ZkgQd2kJw=.dWwmgZmsM8pLO2ZqXYviZA=="
     async for sock in websockets.connect(url):
         try:
-            if subs:
-                sub = prepare_sub(subs)
-                pairs = json.dumps(sub)
-                await sock.send(pairs)
+            # if subs:
+            sub = prepare_sub()
+            pairs = json.dumps(sub)
+            await sock.send(pairs)
             while True:
                 try:
                     orderbook_raw: str = await sock.recv()
                     orderbook: dict = json.loads(orderbook_raw)
-                    orderbook_type = orderbook.get('type')
-                    if orderbook_type:
-                        handle_raw_orderbook(orderbook)
+                    print(1)
+                    # orderbook_type = orderbook.get('type')
+                    # if orderbook_type:
+                    #     handle_raw_orderbook(orderbook)
                 except Exception as e:
                     print(e)
                     break
@@ -104,11 +106,9 @@ async def main(tickers: list[str]):
             sub_chunk.append(f"{prefix}.{depth}.{tick}")
         all_subs.append(sub_chunk)
 
-    tasks = [
-        asyncio.create_task(monitor_socket(numb, ch))
-        for numb, ch in enumerate(all_subs)
-    ]
-    await asyncio.gather(*tasks)
+
+
+    await asyncio.gather(asyncio.create_task(monitor_socket()))
 
 if __name__ == '__main__':
     tickers = [
