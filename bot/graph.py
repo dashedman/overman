@@ -24,6 +24,9 @@ class Edge:
     val: float = field(default=1.0)
     inversed: bool = field(default=False)
 
+    def copy(self):
+        return Edge(self.next_node_index, self.val, self.inversed)
+
 
 @dataclass
 class GraphNode:
@@ -34,6 +37,24 @@ class GraphNode:
 
     def __eq__(self, other: 'GraphNode'):
         return self.value == other.value
+
+    def copy(self):
+        return GraphNode(
+            index=self.index,
+            edges=[edge.copy() for edge in self.edges],
+            value=self.value,
+        )
+
+
+@dataclass
+class Cycle:
+    q: deque[tuple[GraphNode, Edge]]
+
+    def __iter__(self):
+        return iter(self.q)
+
+    def copy(self):
+        return Cycle(self.q.copy())
 
 
 @dataclass
@@ -72,6 +93,9 @@ class Graph:
     def __iter__(self):
         return iter(self.nodes)
 
+    def copy(self) -> 'Graph':
+        return Graph(nodes=[node.copy() for node in self.nodes])
+
     def get_index_for_coin_name(self, coin: str):
         if self.__need_update:
             self.__names_to_index = {}
@@ -91,7 +115,7 @@ class Graph:
             visit_from: list[int],
             edge_from: list[Edge],
             last_edge: Edge,
-    ) -> deque[tuple[GraphNode, Edge]]:
+    ) -> Cycle:
         cycle = deque()
         curr_index = tail_index
         curr_edge = last_edge
@@ -101,7 +125,7 @@ class Graph:
             curr_edge = edge_from[curr_index]
             curr_index = visit_from[curr_index]
         cycle.appendleft((self.nodes[head_index], curr_edge))
-        return cycle
+        return Cycle(cycle)
 
     def get_cycles(
             self,
@@ -109,14 +133,17 @@ class Graph:
             with_start: bool = False,
             max_length: int = None,
             prevent_short_cycles: bool = True,
-    ) -> Generator[deque[tuple[GraphNode, Edge]], None, None]:
+    ) -> Generator[Cycle, None, None]:
         visited: list[VisitStatus] = [VisitStatus.NotVisited] * len(self)
         visit_from: list[int] = [-1] * len(self)
         edge_from: list[Edge | None] = [None] * len(self)
 
-        def bfs_search(curr_index, prev_index, prev_edge, curr_depth):
-            if visited[curr_index] == VisitStatus.Visited:
-                return
+        def dfs_search(
+                curr_index: int,
+                prev_index: int,
+                prev_edge: Edge | None,
+                curr_depth: int
+        ):
             if with_start and max_length is not None and curr_depth > max_length:
                 return
             if visited[curr_index] == VisitStatus.InProcessing:
@@ -131,7 +158,7 @@ class Graph:
                 if prevent_short_cycles and next_edge.next_node_index == prev_index:
                     # detect cycle with length equals to 2
                     continue
-                yield from bfs_search(
+                yield from dfs_search(
                     next_edge.next_node_index,
                     curr_index,
                     next_edge,
@@ -140,7 +167,7 @@ class Graph:
 
             visited[curr_index] = VisitStatus.NotVisited
 
-        yield from bfs_search(start, -1, None, 1)
+        yield from dfs_search(start, -1, None, 1)
 
     # TODO: get_cycles_with_pair
     # TODO: get_cycles_from_node_with_pair
@@ -154,7 +181,7 @@ class Graph:
                 ascii=True,
                 unit=' cycles',
             )
-            cycle_generator: Iterable[deque[tuple[GraphNode, Edge]]]
+            cycle_generator: Iterable[Cycle]
 
             for cycle in cycle_generator:
                 for node, edge in cycle:
@@ -170,6 +197,48 @@ class Graph:
         for node in self:
             for edge in node.edges:
                 print(node.value, self[edge.next_node_index].value, sep='>')
+
+    def fill_profit(self, start: int) -> tuple[float, Cycle]:
+        visited: list[VisitStatus] = [VisitStatus.NotVisited] * len(self)
+        koef_in_node: list[float] = [0] * len(self)
+        visit_from: list[int] = [-1] * len(self)
+        edge_from: list[Edge | None] = [None] * len(self)
+
+        def dfs_search(
+                curr_index: int,
+                prev_index: int,
+                prev_edge: Edge | None,
+                curr_depth: int
+        ):
+            if prev_edge is not None:
+                new_koef = koef_in_node[prev_index] * prev_edge.val
+                if new_koef > koef_in_node[curr_index]:
+                    koef_in_node[curr_index] = new_koef
+                    visit_from[curr_index] = prev_index
+                    edge_from[curr_index] = prev_edge
+
+            if visited[curr_index] == VisitStatus.InProcessing:
+                return
+
+            visited[curr_index] = VisitStatus.InProcessing
+            for next_edge in self.nodes[curr_index].edges:
+                dfs_search(
+                    next_edge.next_node_index,
+                    curr_index,
+                    next_edge,
+                    curr_depth + 1,
+                )
+
+            visited[curr_index] = VisitStatus.NotVisited
+
+        dfs_search(start, -1, None, 1)
+        return koef_in_node[start], self.restore_cycle(
+            start,
+            visit_from[start],
+            visit_from,
+            edge_from,
+            edge_from[start]
+        )
 
 
 if __name__ == '__main__':

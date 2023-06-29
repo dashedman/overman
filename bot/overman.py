@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 from collections import defaultdict, deque
 from functools import cached_property
 from pprint import pprint
@@ -10,7 +11,7 @@ import websockets
 
 import bot.logger
 from bot import utils
-from bot.graph import Graph, GraphNode, Edge
+from bot.graph import Graph, GraphNode, Edge, Cycle
 import dto
 
 
@@ -162,13 +163,34 @@ class Overman:
         if self.order_book_by_ticker[ob_symbol]:
             min_pair = min(self.order_book_by_ticker[ob_symbol])
             self.update_graph(self.tickers_to_pairs[ob_symbol], min_pair.price)
+
+            start_calc = time.time()
             profit = self.check_profit()
+            end_calc = time.time()
             if profit:
                 profit_koef, cycle = profit
-                self.logger.info('Profit: %s, cycle: %s', profit_koef, cycle)
+                self.logger.info(
+                    'Profit: %s, in time: %.3f, cycle: %s',
+                    profit_koef, end_calc - start_calc, cycle
+                )
 
                 next_cycle = cycle.copy()
-                next_cycle.rotate(-1)
+                next_cycle.q.rotate(-1)
+                for index, ((node, edge), (next_node, _)) in enumerate(zip(cycle, next_cycle), start=1):
+                    print(index, node.value, edge.val, next_node.value)
+
+            start_calc = time.time()
+            experimental_profit = self.check_profit_experimental()
+            end_calc = time.time()
+            if experimental_profit:
+                profit_koef, cycle = experimental_profit
+                self.logger.info(
+                    'Experimental Profit: %s, in time: %.3f, cycle: %s',
+                    profit_koef, end_calc - start_calc, cycle
+                )
+
+                next_cycle = cycle.copy()
+                next_cycle.q.rotate(-1)
                 for index, ((node, edge), (next_node, _)) in enumerate(zip(cycle, next_cycle), start=1):
                     print(index, node.value, edge.val, next_node.value)
 
@@ -188,7 +210,7 @@ class Overman:
 
     def check_profit(
             self,
-    ) -> tuple[float, deque[tuple[GraphNode, Edge]]] | None:
+    ) -> tuple[float, Cycle] | None:
         for pivot_coin_index in self.pivot_indexes:
             for cycle in self.graph.get_cycles(
                     start=pivot_coin_index,
@@ -199,6 +221,16 @@ class Overman:
                     profit *= edge.val
                 if profit > 1:
                     return profit, cycle
+        return None
+
+    def check_profit_experimental(
+            self,
+    ) -> tuple[float, Cycle] | None:
+        for pivot_coin_index in self.pivot_indexes:
+            graph_copy = self.graph.copy()
+            profit, cycle = graph_copy.fill_profit(pivot_coin_index)
+            if profit > 1:
+                return profit, cycle
         return None
 
     async def load_graph(self) -> list[tuple[str, str]]:
