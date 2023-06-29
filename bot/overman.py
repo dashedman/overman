@@ -184,12 +184,42 @@ class Overman:
                     print(index, node.value, edge.val, next_node.value)
 
             start_calc = time.time()
+            profit = self.check_max_profit()
+            end_calc = time.time()
+            if profit:
+                profit_koef, cycle = profit
+                self.logger.info(
+                    'MAX Profit: %s, in time: %.3f, cycle: %s',
+                    profit_koef, end_calc - start_calc, cycle
+                )
+
+                next_cycle = cycle.copy()
+                next_cycle.q.rotate(-1)
+                for index, ((node, edge), (next_node, _)) in enumerate(zip(cycle, next_cycle), start=1):
+                    print(index, node.value, edge.val, next_node.value)
+
+            start_calc = time.time()
             experimental_profit = self.check_profit_experimental()
             end_calc = time.time()
             if experimental_profit:
                 profit_koef, cycle = experimental_profit
                 self.logger.info(
                     'Experimental Profit: %s, in time: %.3f, cycle: %s',
+                    profit_koef, end_calc - start_calc, cycle
+                )
+
+                next_cycle = cycle.copy()
+                next_cycle.q.rotate(-1)
+                for index, ((node, edge), (next_node, _)) in enumerate(zip(cycle, next_cycle), start=1):
+                    print(index, node.value, edge.val, next_node.value)
+
+            start_calc = time.time()
+            experimental_profit = self.check_profit_experimental_2()
+            end_calc = time.time()
+            if experimental_profit:
+                profit_koef, cycle = experimental_profit
+                self.logger.info(
+                    'Experimental 2 Profit: %s, in time: %.3f, cycle: %s',
                     profit_koef, end_calc - start_calc, cycle
                 )
 
@@ -227,12 +257,40 @@ class Overman:
                     return profit, cycle
         return None
 
+    def check_max_profit(
+            self,
+    ) -> tuple[float, Cycle] | None:
+        max_profit = 0
+        max_cycle = None
+        for pivot_coin_index in self.pivot_indexes:
+            for cycle in self.graph.get_cycles(
+                    start=pivot_coin_index,
+                    with_start=True
+            ):
+                profit = 1
+                for _, edge in cycle:
+                    profit *= edge.val
+                if profit > max_profit:
+                    max_profit = profit
+                    max_cycle = cycle
+        if max_cycle:
+            return max_profit, max_cycle
+        return None
+
     def check_profit_experimental(
             self,
     ) -> tuple[float, Cycle] | None:
         for pivot_coin_index in self.pivot_indexes:
-            graph_copy = self.graph.copy()
-            profit, cycle = graph_copy.fill_profit(pivot_coin_index)
+            profit, cycle = self.graph.get_profit(pivot_coin_index)
+            if profit > 1:
+                return profit, cycle
+        return None
+
+    def check_profit_experimental_2(
+            self,
+    ) -> tuple[float, Cycle] | None:
+        for pivot_coin_index in self.pivot_indexes:
+            profit, cycle = self.graph.get_profit_2(pivot_coin_index)
             if profit > 1:
                 return profit, cycle
         return None
@@ -263,12 +321,12 @@ class Overman:
             edges = []
             for tail in base_coins[node_key]:
                 try:
-                    edges.append(Edge(node_keys.index(tail), 0, False))
+                    edges.append(Edge(index, node_keys.index(tail), 0, False))
                 except ValueError:
                     continue
             for tail in inv_base_coins[node_key]:
                 try:
-                    edges.append(Edge(node_keys.index(tail), 0, True))
+                    edges.append(Edge(index, node_keys.index(tail), 0, True))
                 except ValueError:
                     continue
             node_list.append(GraphNode(index, edges=edges, value=node_key))

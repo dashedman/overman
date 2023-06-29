@@ -1,3 +1,4 @@
+import itertools
 from enum import IntEnum
 from typing import Generator, Any, TypeVar, Iterable
 from dataclasses import dataclass, field
@@ -20,12 +21,16 @@ class VisitStatus(IntEnum):
 
 @dataclass
 class Edge:
+    origin_node_index: int
     next_node_index: int
     val: float = field(default=1.0)
     inversed: bool = field(default=False)
 
     def copy(self):
-        return Edge(self.next_node_index, self.val, self.inversed)
+        return Edge(self.origin_node_index,
+                    self.next_node_index,
+                    self.val,
+                    self.inversed)
 
 
 @dataclass
@@ -92,6 +97,12 @@ class Graph:
 
     def __iter__(self):
         return iter(self.nodes)
+
+    @property
+    def edges(self):
+        return itertools.chain.from_iterable(
+            node.edges for node in self.nodes
+        )
 
     def copy(self) -> 'Graph':
         return Graph(nodes=[node.copy() for node in self.nodes])
@@ -198,7 +209,7 @@ class Graph:
             for edge in node.edges:
                 print(node.value, self[edge.next_node_index].value, sep='>')
 
-    def fill_profit(self, start: int) -> tuple[float, Cycle]:
+    def get_profit(self, start: int) -> tuple[float, Cycle]:
         visited: list[VisitStatus] = [VisitStatus.NotVisited] * len(self)
         koef_in_node: list[float] = [0] * len(self)
         visit_from: list[int] = [-1] * len(self)
@@ -240,6 +251,38 @@ class Graph:
             edge_from[start]
         )
 
+    def get_profit_2(self, start: int) -> tuple[float, Cycle]:
+        visited: list[VisitStatus] = [VisitStatus.NotVisited] * len(self)
+        koef_in_node: list[float] = [0] * len(self)
+        visit_from: list[int] = [-1] * len(self)
+        edge_from: list[Edge | None] = [None] * len(self)
+
+        q = deque((start,))
+        # bfs
+        while q:
+            curr_index = q.popleft()
+            curr_node = self.nodes[curr_index]
+            curr_koef = koef_in_node[curr_index] if curr_index != start else 1
+
+            for edge in curr_node.edges:
+                new_koef = curr_koef * edge.val
+                if new_koef > koef_in_node[edge.next_node_index]:
+                    koef_in_node[edge.next_node_index] = new_koef
+                    visit_from[edge.next_node_index] = edge.origin_node_index
+                    edge_from[edge.next_node_index] = edge
+                    if visited[edge.next_node_index] is VisitStatus.NotVisited:
+                        q.append(edge.next_node_index)
+                        visited[edge.next_node_index] = VisitStatus.Visited
+
+        return koef_in_node[start], self.restore_cycle(
+            start,
+            visit_from[start],
+            visit_from,
+            edge_from,
+            edge_from[start]
+        )
+
+
 
 if __name__ == '__main__':
 
@@ -258,7 +301,7 @@ if __name__ == '__main__':
     raw_edges: list[list[Edge]] = [[] for _ in range(n)]
     for _ in range(m):
         v1, v2, val = map(int, input().split(' '))
-        raw_edges[v1].append(Edge(v2, val))
+        raw_edges[v1].append(Edge(v1, v2, val))
 
     test_graph = Graph([
         GraphNode(index, e, str(index)) for index, e in enumerate(raw_edges)
