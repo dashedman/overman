@@ -204,8 +204,9 @@ class Overman:
             if experimental_profit:
                 profit_koef, cycle = experimental_profit
                 self.logger.info(
-                    'Experimental Profit: %s, in time: %.3f, cycle: %s',
-                    profit_koef, end_calc - start_calc, cycle
+                    'Experimental Profit: %s, validate_profit: %s, in time: %.3f, cycle: %s',
+                    profit_koef, cycle.get_profit(),
+                    end_calc - start_calc, cycle
                 )
 
                 next_cycle = cycle.copy()
@@ -219,8 +220,9 @@ class Overman:
             if experimental_profit:
                 profit_koef, cycle = experimental_profit
                 self.logger.info(
-                    'Experimental 2 Profit: %s, in time: %.3f, cycle: %s',
-                    profit_koef, end_calc - start_calc, cycle
+                    'Experimental 2 Profit: %s, validate_profit: %s, in time: %.3f, cycle: %s',
+                    profit_koef, cycle.get_profit(),
+                    end_calc - start_calc, cycle
                 )
 
                 next_cycle = cycle.copy()
@@ -250,9 +252,7 @@ class Overman:
                     start=pivot_coin_index,
                     with_start=True
             ):
-                profit = 1
-                for _, edge in cycle:
-                    profit *= edge.val
+                profit = cycle.get_profit()
                 if profit > 1:
                     return profit, cycle
         return None
@@ -267,9 +267,7 @@ class Overman:
                     start=pivot_coin_index,
                     with_start=True
             ):
-                profit = 1
-                for _, edge in cycle:
-                    profit *= edge.val
+                profit = cycle.get_profit()
                 if profit > max_profit:
                     max_profit = profit
                     max_cycle = cycle

@@ -61,6 +61,11 @@ class Cycle:
     def copy(self):
         return Cycle(self.q.copy())
 
+    def get_profit(self):
+        profit = 1
+        for _, edge in self.q:
+            profit *= edge.val
+
 
 @dataclass
 class Graph:
