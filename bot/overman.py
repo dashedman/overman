@@ -63,7 +63,11 @@ class Overman:
         # init graph
         self.logger.info('Loading graph')
         pairs = await self.load_graph()
-        self.logger.info('Loaded %s pairs.', len(pairs))
+        self.logger.info(
+            'Loaded %s pairs, nodes: %s, edges: %s.',
+            len(pairs), len(self.graph),
+            sum(len(node.edges) for node in self.graph)
+        )
         self.tickers_to_pairs = {
             base_coin + '-' + quote_coin: (base_coin, quote_coin)
             for base_coin, quote_coin in pairs
