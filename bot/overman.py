@@ -30,7 +30,7 @@ class Overman:
         self.pivot_coins = pivot_coins
         self.order_book_by_ticker: dict[str, set['dto.OrderBookPair']] \
             = defaultdict(set)
-        self.token = None
+        self.__token = None
 
     @cached_property
     def logger(self):
@@ -52,10 +52,16 @@ class Overman:
             "response": True
         }
 
+    @property
+    def token(self):
+        if self.__token is None:
+            self.reload_token()
+        return self.__token
+
     def reload_token(self):
         url = 'https://api.kucoin.com/api/v1/bullet-public'
         res = requests.post(url)
-        self.token = res.json()['data']['token']
+        self.__token = res.json()['data']['token']
 
     def run(self):
         asyncio.run(self.serve())
@@ -87,7 +93,6 @@ class Overman:
         # trade if graph gave a signal
 
     async def monitor_socket(self, subs: tuple[str]):
-        self.reload_token()
         url = f"wss://ws-api-spot.kucoin.com/?token={self.token}"
         async for sock in websockets.connect(url):
             try:
