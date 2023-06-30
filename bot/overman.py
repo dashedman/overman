@@ -30,11 +30,7 @@ class Overman:
         self.pivot_coins = pivot_coins
         self.order_book_by_ticker: dict[str, set['dto.OrderBookPair']] \
             = defaultdict(set)
-        self.token = (
-            "2neAiuYvAU61ZDXANAGAsiL4-iAExhsBXZxftpOeh_55i3Ysy2q2LEsEWU64mdzUOP"
-            "usi34M_wGoSf7iNyEWJ61c9cBSu34minkkRmbD8qeAA2RniAeBpNiYB9J6i9GjsxUu"
-            "hPw3BlrzazF6ghq4L-l3quUQN_RjW3ZkgQd2kJw=.dWwmgZmsM8pLO2ZqXYviZA=="
-        )
+        self.token = None
 
     @cached_property
     def logger(self):
@@ -48,13 +44,18 @@ class Overman:
         ]
 
     @staticmethod
-    def prepare_sub(subs_chunk: list[str]):
+    def prepare_sub(subs_chunk: tuple[str]):
         return {
             "id": "test",
             "type": "subscribe",
             "topic": f"/spotMarket/level2Depth5:{','.join(subs_chunk)}",
             "response": True
         }
+
+    def reload_token(self):
+        url = 'https://api.kucoin.com/api/v1/bullet-public'
+        res = requests.post(url)
+        self.token = res.json()['data']['token']
 
     def run(self):
         asyncio.run(self.serve())
@@ -74,23 +75,19 @@ class Overman:
         }
 
         # starting to listen sockets
-        ticker_chunks = utils.chunk(self.tickers_to_pairs.keys(), 10000)
-        all_subs = []
-        for ticker_ch in ticker_chunks:
-            sub_chunk = []
-            for tick in ticker_ch:
-                sub_chunk.append(f"{tick}")
-            all_subs.append(sub_chunk)
+        # max 100 tickers per connection
+        ticker_chunks = utils.chunk(self.tickers_to_pairs.keys(), 100)
 
         tasks = [
             asyncio.create_task(self.monitor_socket(ch))
-            for ch in all_subs
+            for ch in ticker_chunks
         ]
         await asyncio.gather(*tasks)
         # edit graph
         # trade if graph gave a signal
 
-    async def monitor_socket(self, subs: list[str]):
+    async def monitor_socket(self, subs: tuple[str]):
+        self.reload_token()
         url = f"wss://ws-api-spot.kucoin.com/?token={self.token}"
         async for sock in websockets.connect(url):
             try:
@@ -102,12 +99,15 @@ class Overman:
                     try:
                         orderbook_raw: str = await sock.recv()
                         orderbook: dict = json.loads(orderbook_raw)
-                        orderbook_type = orderbook.get('type')
-                        if orderbook_type:
-                            ...
-                            # self.handle_raw_orderbook(orderbook)
+                        if orderbook.get('code') == 401:
+                            self.logger.info("Token has been expired")
+                            self.reload_token()
+                            self.logger.info("Token reloaded")
                         else:
-                            pprint(orderbook)
+                            if orderbook.get('data') is not None:
+                                self.handle_raw_orderbook_data(orderbook)
+                            else:
+                                pprint(orderbook)
                     except Exception as e:
                         self.logger.error(
                             'Catch error while monitoring socket:\n',
@@ -116,57 +116,38 @@ class Overman:
             except websockets.ConnectionClosed as e:
                 self.logger.error('websocket error', exc_info=e)
 
-    def handle_raw_orderbook(
+    def handle_raw_orderbook_data(
             self,
-            raw_orderbook: dict[str, str | dict[str, str | list[str]]]
+            raw_orderbook: dict[str, str | dict[str, int | list[list[str]]]]
     ):
         """
-        Example snapshot:
-
-        {'topic': 'orderbook.50.DYDXUSDT', 'ts': 1687687095565, 'type': 'snapshot',
-         'data': {'s': 'DYDXUSDT', 'b': [['2.001', '360.697'], ['1.971', '292.256'],
-          ['1.97', '453.245'], ['1.968', '672.694'], ['1.967', '690.698'],
-           ['1.966', '743.749'], ['1.963', '261.32'], ['1.962', '559.267']],
-            'a': [['2.003', '506.542'], ['2.033', '574.77'], ['2.034', '424.14'],
-             ['2.035', '292.429'], ['2.036', '627.188'], ['2.037', '640.978'],
-              ['2.038', '399.721'], ['2.039', '732.748'], ['2.041', '631.048'],
-               ['2.042', '669.269'], ['2.043', '517.712'], ['2.171', '30.765'],
-                ['2.172', '38.137'], ['2.173', '35.01'], ['2.174', '58.356']],
-                 'u': 19047, 'seq': 499518832}}
-
-        Example delta:
-
-        {'topic': 'orderbook.50.DYDXUSDT', 'ts': 1687687108145, 'type': 'delta',
-         'data': {'s': 'DYDXUSDT', 'b': [['1.963', '261.32'], ['1.965', '0'],
-          ['1.969', '0']], 'a': [['2.033', '554.77']], 'u': 19058, 'seq': 499518911}
-          }
+        {
+             'asks': [['0.00006792', '4.9846'], ['0.00006793', '90.9062'],
+            ['0.00006798', '39.9709'], ['0.00006799', '0.7342'], ['0.00006802',
+            '6.8374']],
+             'bids': [['0.00006781', '49.4415'], ['0.0000678',
+            '2.5265'], ['0.00006771', '90.2718'], ['0.00006764', '271.9394'],
+            ['0.00006758', '2.5348']],
+             'timestamp': 1688157998591
+         }
         """
-        ob_type = raw_orderbook['type']
-        ob_symbol: str = raw_orderbook['data']['s']
-        raw_ask_data = raw_orderbook['data']['a']
+        ticker = raw_orderbook['topic'].split(':')[-1]
+        ob_data: dict[str, list[list[str]]] = raw_orderbook['data']
+        raw_ask_data = ob_data['asks']
+        raw_bids_data = ob_data['bids']
         prepared_ask_data: set['dto.OrderBookPair'] = {
             dto.OrderBookPair(float(orderbook_el[0]), float(orderbook_el[1]))
             for orderbook_el in raw_ask_data
         }
-        if ob_type == 'snapshot':
-            self.order_book_by_ticker[ob_symbol] = prepared_ask_data
-        else:
-            for p_ask in prepared_ask_data:
-                if p_ask in self.order_book_by_ticker[ob_symbol]:
-                    self.order_book_by_ticker[ob_symbol].remove(p_ask)
-                    if p_ask.count != 0:
-                        self.order_book_by_ticker[ob_symbol].add(p_ask)
-                else:
-                    self.order_book_by_ticker[ob_symbol].add(p_ask)
+        self.order_book_by_ticker[ticker] = prepared_ask_data
 
         self.logger.info(
-            f'{ob_type},'
-            f' symbol: {ob_symbol},'
-            f' data: {self.order_book_by_ticker[ob_symbol]}'
+            f' symbol: {ticker},'
+            f' data: {self.order_book_by_ticker[ticker]}'
         )
-        if self.order_book_by_ticker[ob_symbol]:
-            min_pair = min(self.order_book_by_ticker[ob_symbol])
-            self.update_graph(self.tickers_to_pairs[ob_symbol], min_pair.price)
+        if self.order_book_by_ticker[ticker]:
+            min_pair = min(self.order_book_by_ticker[ticker])
+            self.update_graph(self.tickers_to_pairs[ticker], min_pair.price)
 
             start_calc = time.time()
             profit = self.check_profit()
@@ -180,7 +161,8 @@ class Overman:
 
                 next_cycle = cycle.copy()
                 next_cycle.q.rotate(-1)
-                for index, ((node, edge), (next_node, _)) in enumerate(zip(cycle, next_cycle), start=1):
+                for index, ((node, edge), (next_node, _)) in enumerate(
+                        zip(cycle, next_cycle), start=1):
                     print(index, node.value, edge.val, next_node.value)
 
             start_calc = time.time()

@@ -65,6 +65,7 @@ class Cycle:
         profit = 1
         for _, edge in self.q:
             profit *= edge.val
+        return profit
 
 
 @dataclass
