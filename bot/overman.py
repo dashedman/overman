@@ -28,8 +28,7 @@ class Overman:
         self.depth = depth
         self.prefix = prefix
         self.pivot_coins = pivot_coins
-        self.order_book_by_ticker: dict[str, set['dto.OrderBookPair']] \
-            = defaultdict(set)
+        self.order_book_by_ticker: dict[str, 'dto.BestOrders'] = {}
         self.__token = None
 
     @cached_property
@@ -135,6 +134,11 @@ class Overman:
             ['0.00006758', '2.5348']],
              'timestamp': 1688157998591
          }
+         "Ask" (предложение о продаже) - это цена, по которой продавец готов
+         продать определенное количество акций или других ценных бумаг.
+
+         "Bid" (предложение о покупке) - это цена, по которой покупатель готов
+          купить определенное количество акций или других ценных бумаг.
         """
         ticker = raw_orderbook['topic'].split(':')[-1]
         ob_data: dict[str, list[list[str]]] = raw_orderbook['data']
@@ -144,15 +148,29 @@ class Overman:
             dto.OrderBookPair(float(orderbook_el[0]), float(orderbook_el[1]))
             for orderbook_el in raw_ask_data
         }
-        self.order_book_by_ticker[ticker] = prepared_ask_data
+        prepared_bids_data: set['dto.OrderBookPair'] = {
+            dto.OrderBookPair(float(orderbook_el[0]), float(orderbook_el[1]))
+            for orderbook_el in raw_bids_data
+        }
+        self.order_book_by_ticker[ticker] = dto.BestOrders(
+            asks=prepared_ask_data,
+            bids=prepared_bids_data
+        )
 
         self.logger.info(
             f' symbol: {ticker},'
             f' data: {self.order_book_by_ticker[ticker]}'
         )
-        if self.order_book_by_ticker[ticker]:
-            min_pair = min(self.order_book_by_ticker[ticker])
-            self.update_graph(self.tickers_to_pairs[ticker], min_pair.price)
+        if self.order_book_by_ticker[ticker].is_relevant:
+            self.update_graph(
+                self.tickers_to_pairs[ticker],
+                self.order_book_by_ticker[ticker].best_ask
+            )
+            self.update_graph(
+                self.tickers_to_pairs[ticker],
+                self.order_book_by_ticker[ticker].best_bid,
+                invert_values=True
+            )
 
             start_calc = time.time()
             profit = self.check_profit()
@@ -220,15 +238,16 @@ class Overman:
     def update_graph(
             self,
             coins_pair: tuple[str, str],
-            new_value: float,
-            fee: float = 0.001
+            new_value: 'dto.OrderBookPair',
+            fee: float = 0.001,
+            invert_values=False
     ):
         # update pairs
         base_node = self.graph.get_node_for_coin(coins_pair[0])
         quote_node_index = self.graph.get_index_for_coin_name(coins_pair[1])
         for edge in base_node.edges:
             if edge.next_node_index == quote_node_index:
-                edge.val = new_value * (1 - fee)
+                edge.val = new_value.price * (1 - fee)
                 break
 
     def check_profit(
