@@ -17,6 +17,8 @@ class VisitStatus(IntEnum):
     NotVisited = 0
     InProcessing = 1
     Visited = 2
+    InCycle = 3
+    InBranch = 4
 
 
 @dataclass
@@ -67,6 +69,26 @@ class Cycle:
             profit *= edge.val
         return profit
 
+    def validate_cycle(self) -> bool:
+        prev_edge = self.q[-1][1]
+        for node, edge in self.q:
+            if prev_edge is None:
+                return False
+            if prev_edge.next_node_index != node.index:
+                return False
+            prev_edge = edge
+        return True
+
+    def fast_validate(self) -> bool:
+        """ Check last edge goin to first node """
+        return self.q[-1][1].next_node_index == self.q[0][0].index and self.q[0][1] is not None
+
+    def has_node(self, node: GraphNode):
+        return any(node == cycle_node for cycle_node, _ in c.q)
+
+    def has_edge(self, edge: Edge):
+        return any(edge == cycle_edge for _, cycle_edge in c.q)
+
 
 @dataclass
 class Graph:
@@ -88,13 +110,15 @@ class Graph:
                 elif edge_tail.next_node_index > key:
                     edges_to_decrease.append(index)
 
+            if node.index >= key:
+                node.index -= 1
+
             for index in edges_to_decrease:
                 node.edges[index].next_node_index -= 1
-            for index in reversed(edges_to_del):
+            for index in sorted(edges_to_del, reverse=True):
                 node.edges.pop(index)
-
-            if node.index > key:
-                node.index -= 1
+            for edge in node.edges:
+                edge.origin_node_index = node.index
 
         self.__need_update = True
 
@@ -112,6 +136,10 @@ class Graph:
 
     def copy(self) -> 'Graph':
         return Graph(nodes=[node.copy() for node in self.nodes])
+
+    def delete_nodes(self, node_indexes_to_del: Iterable[int]):
+        for index in sorted(node_indexes_to_del, reverse=True):
+            del self[index]
 
     def get_index_for_coin_name(self, coin: str):
         if self.__need_update:
@@ -137,8 +165,11 @@ class Graph:
         curr_index = tail_index
         curr_edge = last_edge
         # unwinding cycle
-        while curr_index != head_index:
-            cycle.appendleft((self.nodes[curr_index], curr_edge))
+        while curr_index != head_index and curr_index != -1:
+            try:
+                cycle.appendleft((self.nodes[curr_index], curr_edge))
+            except IndexError as e:
+                print()
             curr_edge = edge_from[curr_index]
             curr_index = visit_from[curr_index]
         cycle.appendleft((self.nodes[head_index], curr_edge))
@@ -184,31 +215,36 @@ class Graph:
 
             visited[curr_index] = VisitStatus.NotVisited
 
-        yield from dfs_search(start, -1, None, 1)
+        yield from dfs_search(start, -1, None, 0)
 
     # TODO: get_cycles_with_pair
     # TODO: get_cycles_from_node_with_pair
     # TODO: filter graph from nodes without cycles with base coins
     def filter_from_noncycle_nodes(self, base_nodes: list[GraphNode]):
-        checked = [False] * len(self)
+        nodes_in_cycle = set()
+
+        # checked_nodes = [False] * len(self)
         for base_node in base_nodes:
-            cycle_generator = tqdm(
-                self.get_cycles(start=base_node.index, with_start=True, max_length=5),
-                desc=base_node.value,
-                ascii=True,
-                unit=' cycles',
+            nodes_in_cycle.update(
+                self.get_nodes_in_cycles(base_node.index, max_length=4)
             )
-            cycle_generator: Iterable[Cycle]
 
-            for cycle in cycle_generator:
-                for node, edge in cycle:
-                    checked[node.index] = True
+            # It's old algo to filter non cycled nodes
+            # But it's stabe. So we dont erase code to test with this algo
+            # cycle_generator = tqdm(
+            #     self.get_cycles(start=base_node.index, with_start=True, max_length=4),
+            #     desc=base_node.value,
+            #     ascii=True,
+            #     unit=' cycles',
+            # )
+            # cycle_generator: Iterable[Cycle]
+            #
+            # for cycle in cycle_generator:
+            #     for node, _ in cycle:
+            #         checked_nodes[node.index] = True
 
-        del_count = 0
-        for index, good in enumerate(checked):
-            if not good:
-                del self[index - del_count]
-                del_count += 1
+        nodes_to_del = set(range(len(self))) - nodes_in_cycle
+        self.delete_nodes(nodes_to_del)
 
     def print_pairs(self):
         for node in self:
@@ -265,20 +301,23 @@ class Graph:
 
         q = deque((start,))
         # bfs
-        while q:
-            curr_index = q.popleft()
-            curr_node = self.nodes[curr_index]
-            curr_koef = koef_in_node[curr_index] if curr_index != start else 1
+        with tqdm(total=len(self), ascii=True) as pbar:
+            pbar.update()
+            while q:
+                pbar.update()
+                curr_index = q.popleft()
+                curr_node = self.nodes[curr_index]
+                curr_koef = koef_in_node[curr_index] if curr_index != start else 1
 
-            for edge in curr_node.edges:
-                new_koef = curr_koef * edge.val
-                if new_koef > koef_in_node[edge.next_node_index]:
-                    koef_in_node[edge.next_node_index] = new_koef
-                    visit_from[edge.next_node_index] = edge.origin_node_index
-                    edge_from[edge.next_node_index] = edge
-                    if visited[edge.next_node_index] is VisitStatus.NotVisited:
-                        q.append(edge.next_node_index)
-                        visited[edge.next_node_index] = VisitStatus.Visited
+                for edge in tqdm(curr_node.edges, ascii=True, leave=False):
+                    new_koef = curr_koef * edge.val
+                    if new_koef > koef_in_node[edge.next_node_index]:
+                        koef_in_node[edge.next_node_index] = new_koef
+                        visit_from[edge.next_node_index] = edge.origin_node_index
+                        edge_from[edge.next_node_index] = edge
+                        if visited[edge.next_node_index] is VisitStatus.NotVisited:
+                            q.append(edge.next_node_index)
+                            visited[edge.next_node_index] = VisitStatus.Visited
 
         return koef_in_node[start], self.restore_cycle(
             start,
@@ -288,6 +327,108 @@ class Graph:
             edge_from[start]
         )
 
+    def get_profit_3(self, start: int) -> tuple[float, Cycle | None]:
+        koef_in_node: list[float] = [100000] * len(self)
+        visit_from: list[int] = [-1] * len(self)
+        edge_from: list[Edge | None] = [None] * len(self)
+        is_start = True
+
+        q = deque((start,))
+        # bfs
+        while q:
+            curr_index = q.popleft()
+            curr_node = self.nodes[curr_index]
+            curr_koef = 1 if is_start else koef_in_node[curr_index]
+            is_start = False
+
+            for edge in curr_node.edges:
+                new_koef = curr_koef * edge.val
+                if new_koef == 0:
+                    continue
+                elif new_koef < koef_in_node[edge.next_node_index]:
+                    koef_in_node[edge.next_node_index] = new_koef
+                    visit_from[edge.next_node_index] = edge.origin_node_index
+                    edge_from[edge.next_node_index] = edge
+                    if edge.next_node_index != start:
+                        q.append(edge.next_node_index)
+
+        if visit_from[start] == -1:
+            return -1, None
+
+        return koef_in_node[start], self.restore_cycle(
+            start,
+            visit_from[start],
+            visit_from,
+            edge_from,
+            edge_from[start]
+        )
+
+    def get_nodes_in_cycles(
+            self,
+            start: int,
+            max_length: int,
+    ) -> list[int]:
+        visited: list[VisitStatus] = [VisitStatus.NotVisited] * len(self)
+        node_depth: list[int] = [-1] * len(self)
+        left_to_cycle_end: list[int] = [100000] * len(self)
+
+        def dfs_search(
+                curr_index: int,
+                curr_depth: int,
+        ) -> VisitStatus:
+
+            if curr_depth > max_length:
+                return VisitStatus.NotVisited
+            visit_status = visited[curr_index]
+
+            if visit_status == VisitStatus.NotVisited:
+                visited[curr_index] = VisitStatus.InBranch
+            elif visit_status == VisitStatus.InCycle:
+                if left_to_cycle_end[curr_index] + curr_depth > max_length:
+                    return VisitStatus.NotVisited
+                return VisitStatus.InCycle
+            elif visit_status == VisitStatus.InBranch:
+                if curr_index == start and curr_depth > 2:
+                    left_to_cycle_end[curr_index] = 0
+                    return VisitStatus.InCycle
+                return VisitStatus.NotVisited
+
+            node_depth[curr_index] = curr_depth
+            new_statuses = []
+            for next_edge in self.nodes[curr_index].edges:
+                next_index = next_edge.next_node_index
+
+                new_status = dfs_search(next_index, curr_depth + 1)
+                new_statuses.append((new_status, next_index))
+
+            in_cycle_statuses = [node for status, node in new_statuses if status == VisitStatus.InCycle]
+            if in_cycle_statuses:
+                nearest_cycle_node = min(in_cycle_statuses, key=lambda index: left_to_cycle_end[index])
+                left_to_cycle_end[curr_index] = min(
+                    left_to_cycle_end[nearest_cycle_node] + 1,
+                    curr_depth
+                )
+                # second try with nodes not inCycle
+                not_cycle = {node for status, node in new_statuses if status != VisitStatus.InCycle}
+                not_cycle_edges = [e for e in self.nodes[curr_index].edges if e.next_node_index in not_cycle]
+                for next_edge in not_cycle_edges:
+                    next_index = next_edge.next_node_index
+                    _ = dfs_search(next_index, min(curr_depth + 1, left_to_cycle_end[curr_index] + 1))
+
+                visited[curr_index] = VisitStatus.InCycle
+                return VisitStatus.InCycle
+
+            if visited[curr_index] != VisitStatus.InBranch:
+                print('WARN')
+            left_to_cycle_end[curr_index] = 100000
+            visited[curr_index] = VisitStatus.NotVisited
+            return VisitStatus.NotVisited
+
+        dfs_search(start, 0)
+        return [
+            index for index, status in enumerate(visited)
+            if status == VisitStatus.InCycle
+        ]
 
 
 if __name__ == '__main__':

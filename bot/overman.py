@@ -1,5 +1,6 @@
 import asyncio
 import json
+import random
 import time
 from collections import defaultdict, deque
 from functools import cached_property
@@ -8,6 +9,7 @@ from typing import Literal
 
 import requests
 import websockets
+from tqdm import tqdm
 
 import bot.logger
 from bot import utils
@@ -157,35 +159,89 @@ class Overman:
             bids=prepared_bids_data
         )
 
-        self.logger.info(
+        self.logger.debug(
             f' symbol: {ticker},'
             f' data: {self.order_book_by_ticker[ticker]}'
         )
         if self.order_book_by_ticker[ticker].is_relevant:
             self.update_graph(
                 self.tickers_to_pairs[ticker],
-                self.order_book_by_ticker[ticker].best_ask
+                self.order_book_by_ticker[ticker].best_ask,
             )
             self.update_graph(
                 self.tickers_to_pairs[ticker],
                 self.order_book_by_ticker[ticker].best_bid,
-                invert_values=True
+                inverted=True,
             )
 
+            if not sum(edge.val != 0 for edge in self.graph.edges) < 200:
+                return
+
+            if random.random() < 0.99:
+                return 
+            # start_calc = time.time()
+            # profit = self.check_profit()
+            # end_calc = time.time()
+            # if profit:
+            #     profit_koef, cycle = profit
+            #     self.logger.info(
+            #         'Profit: %s, in time: %.3f, cycle: %s',
+            #         profit_koef, end_calc - start_calc, cycle
+            #     )
+            #
+            #     next_cycle = cycle.copy()
+            #     next_cycle.q.rotate(-1)
+            #     for index, ((node, edge), (next_node, _)) in enumerate(
+            #             zip(cycle, next_cycle), start=1):
+            #         print(index, node.value, edge.val, next_node.value)
+
+            # start_calc = time.time()
+            # experimental_profit = self.check_profit_experimental()
+            # end_calc = time.time()
+            # if experimental_profit:
+            #     profit_koef, cycle = experimental_profit
+            #     self.logger.info(
+            #         'Experimental Profit: %s, validate_profit: %s, in time: %.3f, cycle: %s',
+            #         profit_koef, cycle.get_profit(),
+            #         end_calc - start_calc, cycle
+            #     )
+            #
+            #     next_cycle = cycle.copy()
+            #     next_cycle.q.rotate(-1)
+            #     for index, ((node, edge), (next_node, _)) in enumerate(zip(cycle, next_cycle), start=1):
+            #         print(index, node.value, edge.val, next_node.value)
+
+            # start_calc = time.time()
+            # experimental_profit = self.check_profit_experimental_2()
+            # end_calc = time.time()
+            # if experimental_profit:
+            #     profit_koef, cycle = experimental_profit
+            #     self.logger.info(
+            #         'Experimental 2 Profit: %s, validate_profit: %s, in time: %.3f, cycle: %s',
+            #         profit_koef, cycle.get_profit(),
+            #         end_calc - start_calc, cycle
+            #     )
+            #
+            #     next_cycle = cycle.copy()
+            #     next_cycle.q.rotate(-1)
+            #     for index, ((node, edge), (next_node, _)) in enumerate(zip(cycle, next_cycle), start=1):
+            #         print(index, node.value, edge.val, next_node.value)
+
             start_calc = time.time()
-            profit = self.check_profit()
+            experimental_profit = self.check_profit_experimental_3()
             end_calc = time.time()
-            if profit:
-                profit_koef, cycle = profit
+            if experimental_profit:
+                profit_koef, cycle = experimental_profit
+                # profit_readable = 1 / profit_koef * 100 - 100
                 self.logger.info(
-                    'Profit: %s, in time: %.3f, cycle: %s',
-                    profit_koef, end_calc - start_calc, cycle
+                    'Experimental Profit: %.9f%%, validate_profit: %s, in time: %.3f, cycle: %s',
+                    profit_koef, cycle.get_profit(),
+                    end_calc - start_calc, cycle
                 )
 
                 next_cycle = cycle.copy()
                 next_cycle.q.rotate(-1)
-                for index, ((node, edge), (next_node, _)) in enumerate(
-                        zip(cycle, next_cycle), start=1):
+                for index, ((node, edge), (next_node, _)) in enumerate(zip(cycle, next_cycle), start=1):
                     print(index, node.value, edge.val, next_node.value)
 
             start_calc = time.time()
@@ -193,41 +249,12 @@ class Overman:
             end_calc = time.time()
             if profit:
                 profit_koef, cycle = profit
+                if profit_koef > 1:
+                    return
+                # profit_readable = 1 / profit_koef * 100 - 100
                 self.logger.info(
-                    'MAX Profit: %s, in time: %.3f, cycle: %s',
+                    'MAX Profit: %.9f%%, in time: %.3f, cycle: %s',
                     profit_koef, end_calc - start_calc, cycle
-                )
-
-                next_cycle = cycle.copy()
-                next_cycle.q.rotate(-1)
-                for index, ((node, edge), (next_node, _)) in enumerate(zip(cycle, next_cycle), start=1):
-                    print(index, node.value, edge.val, next_node.value)
-
-            start_calc = time.time()
-            experimental_profit = self.check_profit_experimental()
-            end_calc = time.time()
-            if experimental_profit:
-                profit_koef, cycle = experimental_profit
-                self.logger.info(
-                    'Experimental Profit: %s, validate_profit: %s, in time: %.3f, cycle: %s',
-                    profit_koef, cycle.get_profit(),
-                    end_calc - start_calc, cycle
-                )
-
-                next_cycle = cycle.copy()
-                next_cycle.q.rotate(-1)
-                for index, ((node, edge), (next_node, _)) in enumerate(zip(cycle, next_cycle), start=1):
-                    print(index, node.value, edge.val, next_node.value)
-
-            start_calc = time.time()
-            experimental_profit = self.check_profit_experimental_2()
-            end_calc = time.time()
-            if experimental_profit:
-                profit_koef, cycle = experimental_profit
-                self.logger.info(
-                    'Experimental 2 Profit: %s, validate_profit: %s, in time: %.3f, cycle: %s',
-                    profit_koef, cycle.get_profit(),
-                    end_calc - start_calc, cycle
                 )
 
                 next_cycle = cycle.copy()
@@ -240,41 +267,51 @@ class Overman:
             coins_pair: tuple[str, str],
             new_value: 'dto.OrderBookPair',
             fee: float = 0.001,
-            invert_values=False
+            inverted: bool = False,
     ):
         # update pairs
-        base_node = self.graph.get_node_for_coin(coins_pair[0])
-        quote_node_index = self.graph.get_index_for_coin_name(coins_pair[1])
-        for edge in base_node.edges:
-            if edge.next_node_index == quote_node_index:
-                edge.val = new_value.price * (1 - fee)
+        if inverted:
+            coins_pair = coins_pair[::-1]
+
+        quote_node = self.graph.get_node_for_coin(coins_pair[1])
+        base_node_index = self.graph.get_index_for_coin_name(coins_pair[0])
+        for edge in quote_node.edges:
+            if edge.next_node_index == base_node_index:
+
+                if inverted:
+                    edge.val = 1 / (new_value.price * (1 - fee))
+                else:
+                    edge.val = new_value.price / (1 - fee)
                 break
 
     def check_profit(
             self,
     ) -> tuple[float, Cycle] | None:
         for pivot_coin_index in self.pivot_indexes:
-            for cycle in self.graph.get_cycles(
+            for cycle in tqdm(self.graph.get_cycles(
                     start=pivot_coin_index,
-                    with_start=True
-            ):
+                    with_start=True,
+                    max_length=5,
+            ), ascii=True):
                 profit = cycle.get_profit()
-                if profit > 1:
+                if profit < 1:
                     return profit, cycle
         return None
 
     def check_max_profit(
             self,
     ) -> tuple[float, Cycle] | None:
-        max_profit = 0
+        max_profit = 100000
         max_cycle = None
         for pivot_coin_index in self.pivot_indexes:
-            for cycle in self.graph.get_cycles(
+            for cycle in tqdm(
+                    self.graph.get_cycles(
                     start=pivot_coin_index,
-                    with_start=True
-            ):
+                    with_start=True,
+                    max_length=3,
+            ), ascii=True):
                 profit = cycle.get_profit()
-                if profit > max_profit:
+                if profit != 0 and profit < max_profit:
                     max_profit = profit
                     max_cycle = cycle
         if max_cycle:
@@ -286,7 +323,7 @@ class Overman:
     ) -> tuple[float, Cycle] | None:
         for pivot_coin_index in self.pivot_indexes:
             profit, cycle = self.graph.get_profit(pivot_coin_index)
-            if profit > 1:
+            if profit < 1:
                 return profit, cycle
         return None
 
@@ -295,8 +332,22 @@ class Overman:
     ) -> tuple[float, Cycle] | None:
         for pivot_coin_index in self.pivot_indexes:
             profit, cycle = self.graph.get_profit_2(pivot_coin_index)
-            if profit > 1:
+            if profit < 1:
                 return profit, cycle
+        return None
+
+    def check_profit_experimental_3(
+            self,
+    ) -> tuple[float, Cycle] | None:
+        for pivot_coin_index in self.pivot_indexes:
+            profit, cycle = self.graph.get_profit_3(pivot_coin_index)
+            if cycle and not cycle.validate_cycle():
+                print('bad cycle')
+                return None
+            if profit != -1 and profit < 1:
+                return profit, cycle
+            elif profit != -1:
+                self.logger.info('Best profit: %s for %s', profit, pivot_coin_index)
         return None
 
     async def load_graph(self) -> list[tuple[str, str]]:

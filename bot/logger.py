@@ -29,7 +29,7 @@ field_colormap = {
     'username': {'color': 'yellow'}
 }
 coloredlogs.install(
-    level=logging.DEBUG,
+    level=logging.INFO,
     fmt='[%(asctime)s|%(name)s|%(levelname)7s] %(message)s',
     level_styles=level_colormap,
     field_styles=field_colormap,
