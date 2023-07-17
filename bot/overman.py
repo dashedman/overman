@@ -1,8 +1,7 @@
 import asyncio
 import json
-import random
 import time
-from collections import defaultdict, deque
+from collections import defaultdict
 from functools import cached_property
 from pprint import pprint
 from typing import Literal

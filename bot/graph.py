@@ -84,10 +84,10 @@ class Cycle:
         return self.q[-1][1].next_node_index == self.q[0][0].index and self.q[0][1] is not None
 
     def has_node(self, node: GraphNode):
-        return any(node == cycle_node for cycle_node, _ in c.q)
+        return any(node == cycle_node for cycle_node, _ in self.q)
 
     def has_edge(self, edge: Edge):
-        return any(edge == cycle_edge for _, cycle_edge in c.q)
+        return any(edge == cycle_edge for _, cycle_edge in self.q)
 
 
 @dataclass
@@ -166,10 +166,7 @@ class Graph:
         curr_edge = last_edge
         # unwinding cycle
         while curr_index != head_index and curr_index != -1:
-            try:
-                cycle.appendleft((self.nodes[curr_index], curr_edge))
-            except IndexError as e:
-                print()
+            cycle.appendleft((self.nodes[curr_index], curr_edge))
             curr_edge = edge_from[curr_index]
             curr_index = visit_from[curr_index]
         cycle.appendleft((self.nodes[head_index], curr_edge))
@@ -418,8 +415,6 @@ class Graph:
                 visited[curr_index] = VisitStatus.InCycle
                 return VisitStatus.InCycle
 
-            if visited[curr_index] != VisitStatus.InBranch:
-                print('WARN')
             left_to_cycle_end[curr_index] = 100000
             visited[curr_index] = VisitStatus.NotVisited
             return VisitStatus.NotVisited
