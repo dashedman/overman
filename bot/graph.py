@@ -3,6 +3,7 @@ from enum import IntEnum
 from typing import Generator, Any, TypeVar, Iterable
 from dataclasses import dataclass, field
 from collections import deque
+from decimal import Decimal
 
 from tqdm import tqdm
 
@@ -26,13 +27,17 @@ class Edge:
     origin_node_index: int
     next_node_index: int
     val: float = field(default=1.0)
+    volume: float = field(default=1.0)
     inversed: bool = field(default=False)
+    original_price: Decimal = field(default=Decimal(1))
 
     def copy(self):
         return Edge(self.origin_node_index,
                     self.next_node_index,
                     self.val,
-                    self.inversed)
+                    self.volume,
+                    self.inversed,
+                    self.original_price)
 
 
 @dataclass
@@ -56,14 +61,20 @@ class GraphNode:
 @dataclass
 class Cycle:
     q: deque[tuple[GraphNode, Edge]]
+    
+    def __len__(self):
+        return len(self.q)
 
     def __iter__(self):
         return iter(self.q)
 
+    def __getitem__(self, item):
+        return self.q[item]
+
     def copy(self):
         return Cycle(self.q.copy())
 
-    def get_profit(self):
+    def get_profit(self) -> float:
         profit = 1
         for _, edge in self.q:
             profit *= edge.val
@@ -88,6 +99,25 @@ class Cycle:
 
     def has_edge(self, edge: Edge):
         return any(edge == cycle_edge for _, cycle_edge in self.q)
+
+    def iter_by_pairs(self):
+        q_iter = iter(self.q)
+        start_node, edge = next(q_iter)
+        prev_node = start_node
+        for next_node, next_edge in q_iter:
+            yield prev_node, edge, next_node
+
+            prev_node = next_node
+            edge = next_edge
+        yield prev_node, edge, start_node
+
+    def iter_by_pairs_reversed(self):
+        q_iter = reversed(self.q)
+        end_node, _ = self.q[0]
+        next_node = end_node
+        for prev_node, edge in q_iter:
+            yield prev_node, edge, next_node
+            next_node = prev_node
 
 
 @dataclass
@@ -129,7 +159,7 @@ class Graph:
         return iter(self.nodes)
 
     @property
-    def edges(self):
+    def edges(self) -> Iterable[Edge]:
         return itertools.chain.from_iterable(
             node.edges for node in self.nodes
         )
@@ -153,6 +183,13 @@ class Graph:
     def get_node_for_coin(self, coin: str):
         return self.nodes[self.get_index_for_coin_name(coin)]
 
+    def get_edges_for_pair(self, coin1: str, coin2: str):
+        edges = []
+
+        node_1 = self.get_node_for_coin(coin1)
+        for edge in node_1.edges:
+            edge.next_node_index
+
     def restore_cycle(
             self,
             head_index,
@@ -162,11 +199,13 @@ class Graph:
             last_edge: Edge,
     ) -> Cycle:
         cycle = deque()
+        already_visited = set()
         curr_index = tail_index
         curr_edge = last_edge
         # unwinding cycle
-        while curr_index != head_index and curr_index != -1:
+        while curr_index != head_index and curr_index != -1 and curr_index not in already_visited:
             cycle.appendleft((self.nodes[curr_index], curr_edge))
+            already_visited.add(curr_index)
             curr_edge = edge_from[curr_index]
             curr_index = visit_from[curr_index]
         cycle.appendleft((self.nodes[head_index], curr_edge))
@@ -325,9 +364,10 @@ class Graph:
         )
 
     def get_profit_3(self, start: int) -> tuple[float, Cycle | None]:
-        koef_in_node: list[float] = [100000] * len(self)
+        koef_in_node: list[float] = [100000000] * len(self)
         visit_from: list[int] = [-1] * len(self)
         edge_from: list[Edge | None] = [None] * len(self)
+        visited_before: list[frozenset] = [frozenset()] * len(self)
         is_start = True
 
         q = deque((start,))
@@ -336,18 +376,25 @@ class Graph:
             curr_index = q.popleft()
             curr_node = self.nodes[curr_index]
             curr_koef = 1 if is_start else koef_in_node[curr_index]
+            curr_visited_before = visited_before[curr_index]
             is_start = False
 
             for edge in curr_node.edges:
                 new_koef = curr_koef * edge.val
+                next_index = edge.next_node_index
                 if new_koef == 0:
                     continue
-                elif new_koef < koef_in_node[edge.next_node_index]:
-                    koef_in_node[edge.next_node_index] = new_koef
-                    visit_from[edge.next_node_index] = edge.origin_node_index
-                    edge_from[edge.next_node_index] = edge
-                    if edge.next_node_index != start:
-                        q.append(edge.next_node_index)
+                elif next_index in curr_visited_before:
+                    continue
+                elif new_koef < koef_in_node[next_index]:
+                    koef_in_node[next_index] = new_koef
+                    visit_from[next_index] = edge.origin_node_index
+                    edge_from[next_index] = edge
+                    visited_before[next_index] = curr_visited_before.union(
+                        frozenset((next_index,))    # add one node
+                    )
+                    if next_index != start:
+                        q.append(next_index)
 
         if visit_from[start] == -1:
             return -1, None

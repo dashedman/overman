@@ -1,10 +1,11 @@
+from decimal import Decimal
 from dataclasses import dataclass, field
 
 
 @dataclass
 class OrderBookPair:
-    price: float
-    count: float
+    price: Decimal = field(default=Decimal(0.0))
+    count: Decimal = field(default=Decimal(0.0))
 
     def __hash__(self):
         return hash(self.price)
@@ -18,8 +19,8 @@ class OrderBookPair:
 
 @dataclass
 class BestOrders:
-    asks: set['OrderBookPair'] = field(default=set)
-    bids: set['OrderBookPair'] = field(default=set)
+    asks: list['OrderBookPair'] = field(default_factory=list)     # sell orders
+    bids: list['OrderBookPair'] = field(default_factory=list)     # buy orders
 
     @property
     def best_ask(self):
@@ -40,3 +41,7 @@ class BestOrders:
     @property
     def is_relevant(self):
         return not (self.asks_empty or self.bids_empty)
+
+    def ensure_sorted(self):
+        assert self.asks == sorted(self.asks)
+        assert self.bids == sorted(self.bids, reverse=True)
