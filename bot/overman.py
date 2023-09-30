@@ -21,7 +21,7 @@ from tqdm import tqdm
 import bot.logger
 from bot import utils
 from bot.config import Config
-from bot.exceptions import RequestException, BalanceInsufficientError, OrderSizeTooSmallError
+from bot.exceptions import RequestException, BalanceInsufficientError, OrderSizeTooSmallError, OrderCanceledError
 from bot.graph import Graph, GraphNode, Edge, Cycle
 import dto
 
@@ -52,12 +52,23 @@ class PairInfo:
 
 
 @dataclass(kw_only=True)
+class TradeUnit:
+    origin_coin: BaseCoin | QuoteCoin
+    dest_coin: QuoteCoin | BaseCoin
+    price: Decimal
+    is_sell_phase: bool
+    min_size: Decimal
+    max_size: Decimal
+    target_size: Decimal
+
+
+@dataclass(kw_only=True)
 class TradeCycleResult:
     cycle: Cycle
     profit_koef: float
     profit_time: float
     started: bool
-    balance_difference: Decimal
+    balance_difference: Decimal = Decimal(0)
     real_profit: float = 0
     trade_time: float = 0
     overhauls: int = None
@@ -82,6 +93,14 @@ class TradeCycleResult:
         ) + (
             f', fail: {self.fail_reason}' if self.fail_reason else ''
         )
+
+
+@dataclass(kw_only=True)
+class TradeSegmentResult:
+    segment: list[TradeUnit]
+    start_balance: Decimal
+    end_balance: Decimal
+    trade_time: float = 0
 
 
 class Overman:
@@ -201,9 +220,13 @@ class Overman:
         # loading fees
         # max 10 tickers per connection
         self.pair_to_fee = {}
-        ticker_chunks = utils.chunk(self.tickers_to_pairs.keys(), 10)
-        for chunk in tqdm(ticker_chunks, postfix='fees loaded', ascii=True):
-            data = await self.get_trade_fees(chunk)
+        ticker_chunks = utils.chunk(self.tickers_to_pairs.keys(), 150)
+        for chunks in tqdm(ticker_chunks, postfix='fees loaded', ascii=True):
+            data_chunks = await asyncio.gather(*(
+                self.get_trade_fees(subchunk)
+                for subchunk in utils.chunk(chunks, 10)
+            ))
+            data = chain.from_iterable(data_chunks)
             for data_unit in data:
                 pair = self.tickers_to_pairs[data_unit['symbol']]
                 self.pair_to_fee[pair] = Decimal(data_unit['takerFeeRate'])
@@ -395,8 +418,9 @@ class Overman:
             return
 
         self.is_on_trade = True
+        start_time = time.time()
         graph_copy = self.graph.copy()
-        asyncio.create_task(self.process_trade(graph_copy))
+        asyncio.create_task(self.process_trade(graph_copy, time.time() - start_time))
 
     @staticmethod
     def get_time_line():
@@ -405,7 +429,7 @@ class Overman:
     def display(self, info):
         self.status_bar.display(f'[{self.get_time_line()}|status] {info}\r')
 
-    async def process_trade(self, graph: Graph):
+    async def process_trade(self, graph: Graph, copy_time: float):
         start_calc = time.time()
         experimental_profit = await self.loop.run_in_executor(
             None,
@@ -417,27 +441,37 @@ class Overman:
             profit_koef, cycle = experimental_profit
             profit_time = end_calc - start_calc
 
-            self.display(f'Current profit {profit_koef:.4f}, ct: {profit_time:.5f}')
-            if profit_koef == self.last_profit:
-                pass
-            else:
-                now = time.time()
-                if self.last_profit < 1:
-                    self.result_logger.info('Profit %.4f, lifetime %.5f', self.last_profit, now - self.profit_life_start)
-                self.last_profit = profit_koef
-                self.profit_life_start = now
-
-            # if profit_koef >= 1:
-            #     self.display(f'Current profit {profit_koef:.4f}, ct: {profit_time:.5f}')
+            # TIME PRINT
+            # self.display(f'Current profit {profit_koef:.4f}, ct: {profit_time:.5f}')
+            # if profit_koef == self.last_profit:
+            #     pass
             # else:
-            #     res = await self.trade_cycle(cycle, profit_koef, profit_time)
-            #     if res.balance_difference == 0:
-            #         self.display(res.one_line_status())
-            #     else:
-            #         self.result_logger.info(res.one_line_status())
+            #     now = time.time()
+            #     if self.last_profit < 1:
+            #         self.result_logger.info('Profit %.4f, lifetime %.5f',
+            #         self.last_profit, now - self.profit_life_start)
+            #     self.last_profit = profit_koef
+            #     self.profit_life_start = now
+
+            # TRADE
+            if profit_koef >= 1:
+                self.display(
+                    f'Current profit {profit_koef:.4f}, '
+                    f'ct: {profit_time:.5f}, copy time: {copy_time:.5f}'
+                )
+            else:
+                res = await self.trade_cycle(cycle, profit_koef, profit_time)
+                if res.balance_difference == 0:
+                    self.display(res.one_line_status())
+                else:
+                    self.result_logger.info(res.one_line_status())
+
+                if res.started:
+                    await self.update_balance()
         self.is_on_trade = False
 
     async def trade_cycle(self, cycle: Cycle, profit_koef: float, profit_time: float) -> TradeCycleResult:
+        start_time = time.time()
         first_quote_coin = cycle.q[0][0].value
         current_balance = self.current_balance[first_quote_coin]
         predicted_sizes = self.predict_cycle_parameters(cycle)
@@ -452,17 +486,18 @@ class Overman:
                 balance_difference=Decimal(0),
                 fail_reason=f'Start min greater than start max: {start_min} > {start_max}'
             )
-        start_min_balance = start_min * Decimal('1.1') * cycle[0][1].original_price
+        start_min_balance = start_min * cycle[0][1].original_price
         start_max_balance = start_max * cycle[0][1].original_price
         start_amort_balance = current_balance * Decimal(0.3)
 
-        real_start = min(
-            start_max_balance,
-            max(
-                start_min_balance,
-                start_amort_balance
-            )
-        )
+        real_start = start_min_balance
+        # real_start = min(
+        #     start_max_balance,
+        #     max(
+        #         start_min_balance,
+        #         start_amort_balance
+        #     )
+        # )
         if real_start > current_balance:
             return TradeCycleResult(
                 cycle=cycle,
@@ -484,104 +519,88 @@ class Overman:
                 size_max,
             )
         # PREDICT END
-
-        quote_balance = real_start
-        start_time = time.time()
-        overhauls = 0
-        base_balance = Decimal(-1)
-        prev_edge_inv = True    # start value
-
+        # START SEGMENTATION
+        curr_segment = None
+        segments = []
         for cycle_data, predict_data in zip(cycle.iter_by_pairs(), predicted_sizes):
             origin_node, edge, dest_node = cycle_data
             is_sell_phase, size_min, size_max = predict_data
 
-            # balance prediction
             is_buy_phase = not is_sell_phase
             if is_buy_phase:
-                if not prev_edge_inv:
-                    self.logger.info('swap %s = %s (quote_balance = base_balance)', quote_balance, base_balance)
-                    quote_balance = base_balance
-                # base_balance = quote_balance / edge.val
+                need_balance = size_min * edge.original_price
             else:
-                if prev_edge_inv:
-                    self.logger.info('swap %s = %s (base_balance = quote_balance)', base_balance, quote_balance)
-                    base_balance = quote_balance
-                # quote_balance = base_balance / edge.val
+                need_balance = size_min
 
-            prev_edge_inv = edge.inversed
+            if self.current_balance.get(origin_node.value, 0) >= need_balance:
+                curr_segment = []
+                segments.append(curr_segment)
+            curr_segment.append((
+                origin_node, edge, dest_node,
+                is_sell_phase, size_min, size_max
+            ))
 
+        self.logger.info(
+            'Cycle with len %s splited for %s segments: %s',
+            len(cycle), len(segments), ', '.join(str(len(s)) for s in segments)
+        )
+        for seg in segments:
+            self.logger.warning(list(f'({on.value} -> {dn.value})' for on, _, dn, _, _, _ in seg))
+
+        done, pending = await asyncio.wait(
+            [self.trade_segment(seg) for seg in segments]
+        )
+        if pending:
+            self.logger.warning('Pending set is not empty! %s', pending)
+
+        no_exceptions = True
+        seg_results = []
+        for task in done:
             try:
-                if is_buy_phase:
-                    quote_size = quote_balance / edge.original_price
-                    if size_min > quote_size:
-                        self.logger.warning('Start min greater than quote size: %s > %s', size_min, quote_size)
-                    real_size, real_funds, local_overhauls = await self.trade_pair(
-                        origin_node, edge, dest_node,
-                        trade_balance=quote_balance
-                    )
-                    # self.logger.info('Predict base balance difference: %s', real_base - base_balance)
-                    self.logger.info('Buy result: size - %s, funds - %s', real_size, real_funds)
-                    base_balance = real_size
-                    overhauls += local_overhauls
-                else:
-                    if size_min > base_balance:
-                        self.logger.warning('Start min greater than base balance: %s > %s', size_min, base_balance)
-                    real_size, real_funds, local_overhauls = await self.trade_pair(
-                        origin_node, edge, dest_node,
-                        trade_size=base_balance
-                    )
-                    # self.logger.info('Predict quote balance difference: %s', real_quote - quote_balance)
-                    self.logger.info('Sell result: size - %s, funds - %s', real_size, real_funds)
-                    quote_balance = real_funds
-                    overhauls += local_overhauls
-            except OrderSizeTooSmallError:
-                return TradeCycleResult(
-                    cycle=cycle,
-                    profit_koef=profit_koef,
-                    profit_time=profit_time,
-                    started=True,
-                    balance_difference=-real_start,
-                    real_profit=0,
-                    trade_time=time.time() - start_time,
-                    overhauls=overhauls,
-                    fail_reason='Order size is too small. Cycle broken.'
-                )
+                seg_result: TradeSegmentResult = task.result()
+            except Exception as e:
+                self.logger.error('Catch error from segment:', exc_info=e)
+                no_exceptions = False
+            else:
+                seg_results.append(seg_result)
 
-        balance_diff = quote_balance - real_start
-        if quote_balance > 0:
+        if no_exceptions:
+            start_balance = seg_results[0].start_balance
+            end_balance = seg_results[-1].end_balance
+
             return TradeCycleResult(
                 cycle=cycle,
                 profit_koef=profit_koef,
                 profit_time=profit_time,
                 started=True,
-                real_profit=real_start / quote_balance,
+                real_profit=float(start_balance / end_balance),
                 trade_time=time.time() - start_time,
-                overhauls=overhauls,
-                balance_difference=balance_diff
+                balance_difference=end_balance - start_balance
             )
         else:
             return TradeCycleResult(
                 cycle=cycle,
                 profit_koef=profit_koef,
                 profit_time=profit_time,
-                started=False,
-                balance_difference=balance_diff,
-                real_profit=real_start / quote_balance,
+                started=True,
+                balance_difference=Decimal(-1),
                 trade_time=time.time() - start_time,
-                overhauls=overhauls,
-                fail_reason='Balance difference is negative'
+                fail_reason='Segments fault.'
             )
 
     def predict_cycle_parameters(
             self,
-            cycle: Cycle
-    ) -> list[tuple[bool, Decimal, Decimal]]:
+            cycle: Cycle,
+            prefer_start_funds: Decimal = Decimal(0),
+    ) -> list[TradeUnit]:
         default_fee = Decimal('0.001')
         predict_results = []
 
         prev_phase_is_sell = False
-        last_sell_size = 0
-        last_funds = 0
+
+        # Backward prediction
+        last_min_sell_size = 0
+        last_min_funds = 0
         last_max_sell_size = 100000000000
         last_max_funds = 100000000000
         for origin_node, edge, dest_node in cycle.iter_by_pairs_reversed():
@@ -602,12 +621,12 @@ class Overman:
 
             if is_sell_phase:
                 if prev_phase_is_sell:
-                    last_funds = last_sell_size
+                    last_min_funds = last_min_sell_size
                     last_max_funds = last_max_sell_size
 
-                last_sell_size = max(
+                last_min_sell_size = max(
                     min_size,
-                    last_funds / (1 - default_fee) / edge.original_price,
+                    last_min_funds / (1 - default_fee) / edge.original_price,
                     min_funds / edge.original_price
                 ).quantize(size_increment, rounding=ROUND_UP)
                 last_max_sell_size = min(
@@ -615,16 +634,24 @@ class Overman:
                     last_max_funds / (1 - default_fee) / edge.original_price,
                     edge.volume
                 ).quantize(size_increment)
-                predict_results.append((is_sell_phase, last_sell_size, last_max_sell_size))
+                predict_results.append(TradeUnit(
+                    origin_coin=origin_node.value,
+                    dest_coin=dest_node.value,
+                    price=edge.original_price,
+                    is_sell_phase=is_sell_phase,
+                    min_size=last_min_sell_size,
+                    max_size=last_max_sell_size,
+                    target_size=Decimal(0),
+                ))
             else:
                 if not prev_phase_is_sell:
-                    last_sell_size = last_funds
+                    last_min_sell_size = last_min_funds
                     last_max_sell_size = last_max_funds
 
-                last_buy_size = max(
+                last_min_buy_size = max(
                     min_size,
                     # last_sell_size / (1 - default_fee),
-                    last_sell_size,
+                    last_min_sell_size,
                     min_funds / edge.original_price
                 ).quantize(size_increment, rounding=ROUND_UP)
                 last_max_buy_size = min(
@@ -633,9 +660,17 @@ class Overman:
                     last_max_sell_size / edge.original_price,
                     edge.volume
                 ).quantize(size_increment)
-                predict_results.append((is_sell_phase, last_buy_size, last_max_buy_size))
-                last_funds = (
-                    last_buy_size * edge.original_price
+                predict_results.append(TradeUnit(
+                    origin_coin=origin_node.value,
+                    dest_coin=dest_node.value,
+                    price=edge.original_price,
+                    is_sell_phase=is_sell_phase,
+                    min_size=last_min_buy_size,
+                    max_size=last_max_buy_size,
+                    target_size=Decimal(0),
+                ))
+                last_min_funds = (
+                    last_min_buy_size * edge.original_price
                 ).quantize(quote_increment)
                 last_max_funds = (
                     last_max_buy_size * edge.original_price
@@ -643,104 +678,152 @@ class Overman:
 
             prev_phase_is_sell = is_sell_phase
 
+        # Forward prediction
         predict_results.reverse()
+        last_buy_size = Decimal(0)
+        last_funds = prefer_start_funds
+        for trade_unit in predict_results:
+            quote_coin = trade_unit.origin_coin
+            base_coin = trade_unit.dest_coin
+            if trade_unit.is_sell_phase:
+                fixed_pair = (quote_coin, base_coin)
+            else:
+                fixed_pair = (base_coin, quote_coin)
+            pair_info = self.pairs_info[fixed_pair]
+
+            size_increment = Decimal(pair_info.baseIncrement)
+            quote_increment = Decimal(pair_info.quoteIncrement)
+
+            if trade_unit.is_sell_phase:
+                if prev_phase_is_sell:
+                    last_buy_size = last_funds
+
+                last_sell_size = min(
+                    trade_unit.max_size,
+                    max(
+                        trade_unit.min_size,
+                        last_buy_size / trade_unit.price
+                    )
+                ).quantize(size_increment)
+                last_funds = (
+                        last_sell_size * trade_unit.price * (1 - default_fee)
+                ).quantize(quote_increment)
+                trade_unit.target_size = last_sell_size
+            else:
+                if not prev_phase_is_sell:
+                    last_funds = last_buy_size
+
+                last_buy_size = min(
+                    trade_unit.max_size,
+                    max(
+                        trade_unit.min_size,
+                        last_funds / trade_unit.price
+                    )
+                ).quantize(size_increment)
+                trade_unit.target_size = last_buy_size
+
+            prev_phase_is_sell = trade_unit.is_sell_phase
+
         return predict_results
+
+    async def trade_segment(
+            self,
+            segment: list[TradeUnit],
+    ) -> TradeSegmentResult:
+        # prepare
+        trade_unit = segment[0]
+        start_balance = trade_unit.min_size if trade_unit.is_sell_phase else trade_unit.min_size * trade_unit.price
+        start_time = time.time()
+        segment_str = ' -> '.join(
+            chain((unit.origin_coin for unit in segment), (segment[-1].dest_coin,))
+        )
+
+        self.logger.info('Start segment: %s', segment_str)
+        next_size = trade_unit.min_size
+
+        # segment rolling
+        for trade_unit in segment:
+
+            if next_size != trade_unit.target_size:
+                self.logger.warning(
+                    'Predicted size is not equal to real size. Predict: %s, Real: %s',
+                    trade_unit.target_size, next_size
+                )
+
+            try:
+                real_size, real_funds = await self.trade_pair(trade_unit)
+            except BalanceInsufficientError:
+                self.logger.warning('Catch Balance Insufficient Error. Trying again.')
+                real_size, real_funds = await self.trade_pair(trade_unit)
+
+            if trade_unit.is_sell_phase:
+                next_size = real_funds / trade_unit.price
+            else:
+                next_size = real_size
+
+        self.logger.info('End segment: %s', segment_str)
+        return TradeSegmentResult(
+            segment=segment,
+            start_balance=start_balance,
+            end_balance=next_size,
+            trade_time=time.time() - start_time
+        )
 
     async def trade_pair(
             self,
-            node_1: GraphNode,
-            edge: Edge,
-            node_2: GraphNode,
-            *,
-            trade_size: Decimal = None,
-            trade_balance: Decimal = None,
-    ) -> tuple[Decimal, Decimal, int]:
-        quote_coin = node_1.value
-        base_coin = node_2.value
-        is_buy_phase = trade_size is None
-
-        pair_info = self.pairs_info.get((base_coin, quote_coin)) or self.pairs_info[(quote_coin, base_coin)]
-
-        quote_increment = Decimal(pair_info.quoteIncrement)
-        size_increment = Decimal(pair_info.baseIncrement)
-        base_min_size = Decimal(pair_info.baseMinSize)
-        # base_max_size = float(pair_info.baseMaxSize)
-
-        # price = int(edge.original_price / price_increment) * price_increment
-        price = edge.original_price
-        size = (
-            trade_size if trade_size else trade_balance.quantize(
-                quote_increment
-            ) / price
-        ).quantize(size_increment)
-        self.logger.info(
-            'Size resolving: min - %s, ideal - %s, quote incr - %s (trade size: %s, trade balance: %s)',
-            base_min_size, size, quote_increment,
-            trade_size, trade_balance
-        )
-
+            trade_unit: TradeUnit
+    ) -> tuple[Decimal, Decimal]:
         self.logger.info(
             '[%s -> %s] Start. (price: %s; size: %s, funds: %s)',
-            quote_coin, base_coin, price, size, price * size
+            trade_unit.origin_coin, trade_unit.dest_coin,
+            trade_unit.price, trade_unit.target_size,
+            trade_unit.price * trade_unit.target_size
         )
-        if size > edge.volume:
-            self.logger.warning('Size greater than size in edge: %s > %s', size, edge.volume)
+        if trade_unit.is_sell_phase:
+            base_coin = trade_unit.origin_coin
+            quote_coin = trade_unit.dest_coin
+        else:
+            base_coin = trade_unit.dest_coin
+            quote_coin = trade_unit.origin_coin
 
-        for attempt in range(100):
-            try:
-                order_id = await self.create_order(
-                    base_coin=base_coin,
-                    quote_coin=quote_coin,
-                    price=str(price),
-                    size=str(size),
-                )
-            except BalanceInsufficientError as e:
-                self.logger.warning(f'Catch "{e}" error. Trying again...')
-                continue
-
-            order_is_active = True
-            order_result = None
-            while order_is_active:
-                order_result = await self.get_order(order_id)
-                self.logger.info(f'{order_result}')
-                order_is_active = order_result['isActive']
-                if order_is_active:
-                    self.logger.info('[%s -> %s] Order is active for now! Waiting...')
-
-            if order_result['cancelExist']:
-                current_book = self.order_book_by_ticker[
-                    self.pairs_to_tickers.get((base_coin, quote_coin))
-                    or self.pairs_to_tickers[(quote_coin, base_coin)]
-                ]
-                ask, bid = self.tune_to_size(size, current_book)
-                if is_buy_phase:
-                    new_price = ask.price
-                else:
-                    new_price = bid.price
-                self.logger.warning(
-                    '[%s -> %s] Order is canceled! '
-                    'Trying again, Changing price: %s -> %s.',
-                    quote_coin, base_coin,
-                    price, new_price,
-                )
-                price = new_price
-                continue
-
-            fee = Decimal(order_result['fee'])
-            real_size = Decimal(order_result['dealSize'])
-            real_funds = Decimal(order_result['dealFunds'])
-            if is_buy_phase:
-                pass
-            else:
-                self.logger.info('Real Fee: %s', fee / real_funds)
-                real_funds = real_funds - fee.quantize(quote_increment)
-            self.logger.info('[%s -> %s] OK', quote_coin, base_coin)
-            return real_size, real_funds, attempt
-        self.logger.warning(
-            '[%s -> %s] Order is canceled! Cycle broken. Skip.',
-            quote_coin, base_coin
+        order_id = await self.create_order(
+            base_coin=base_coin,
+            quote_coin=quote_coin,
+            price=str(trade_unit.price),
+            size=str(trade_unit.target_size),
         )
-        return Decimal(0), Decimal(0), 0
+
+        order_is_active = True
+        order_result = None
+        while order_is_active:
+            order_result = await self.get_order(order_id)
+            # self.logger.info(f'{order_result}')
+            order_is_active = order_result['isActive']
+            if order_is_active:
+                self.logger.info('[%s -> %s] Order is active for now! Waiting...')
+
+        if order_result['cancelExist']:
+            raise OrderCanceledError(
+                f'[{quote_coin} -> {base_coin}] '
+                f'Order is canceled! Cycle Broken.'
+            )
+
+        fee = Decimal(order_result['fee'])
+        real_size = Decimal(order_result['dealSize'])
+        real_funds = Decimal(order_result['dealFunds'])
+
+        if trade_unit.is_sell_phase:
+            self.logger.info('Real Fee: %s', fee / real_funds)
+            pair_info = self.pairs_info[(base_coin, quote_coin)]
+            quote_increment = Decimal(pair_info.quoteIncrement)
+
+            real_funds = real_funds - fee.quantize(quote_increment)
+        else:
+            # fee is not work, idk :P
+            pass
+
+        self.logger.info('[%s -> %s] OK', quote_coin, base_coin)
+        return real_size, real_funds
 
     async def create_order(
             self,
@@ -892,7 +975,7 @@ class Overman:
         )
         return self.get_order_book_from_raw(data)
 
-    async def get_trade_fees(self, symbols: tuple[str]):
+    async def get_trade_fees(self, symbols: tuple[str]) -> list[dict[str, Any]]:
         return await self.do_request(
             'GET', '/api/v1/trade-fees',
             params={'symbols': ','.join(symbols)},

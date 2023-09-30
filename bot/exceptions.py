@@ -13,3 +13,7 @@ class BalanceInsufficientError(RequestException):
 class OrderSizeTooSmallError(RequestException):
     pass
 
+
+class OrderCanceledError(RequestException):
+    pass
+
