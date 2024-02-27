@@ -17,3 +17,7 @@ class OrderSizeTooSmallError(RequestException):
 class OrderCanceledError(RequestException):
     pass
 
+
+class PredictionException(OvermanException):
+    def __init__(self, reason: str):
+        self.reason = reason

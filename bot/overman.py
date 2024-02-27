@@ -186,7 +186,7 @@ class Overman:
 
     def run(self):
         try:
-            asyncio.run(self.serve())
+            asyncio.run(self.serve(), debug=True)
         except KeyboardInterrupt:
             self.logger.info('Ended by keyboard interrupt')
 
@@ -195,6 +195,31 @@ class Overman:
         self.logger.info('Loading graph')
         self.loop = asyncio.get_running_loop()
 
+        await self.load_tickers()
+        await self.load_fees()
+
+        # starting to listen sockets
+        # max 100 tickers per connection
+        ticker_chunks = utils.chunk(self.tickers_to_pairs.keys(), 50)
+
+        tasks = [
+            asyncio.create_task(self.monitor_socket(ch))
+            for ch in ticker_chunks
+        ]
+        tasks.append(
+            asyncio.create_task(self.status_monitor())
+        )
+
+        self.result_logger.info('Start trading')
+        try:
+            await asyncio.gather(*tasks)
+        except asyncio.CancelledError:
+            await self.session.close()
+        self.result_logger.info('End trading')
+        # edit graph
+        # trade if graph gave a signal
+
+    async def load_tickers(self):
         pairs_raw = await self.do_request('GET', '/api/v2/symbols')
 
         pairs = await self.load_graph(pairs_raw)
@@ -217,6 +242,7 @@ class Overman:
             sum(len(node.edges) for node in self.graph)
         )
 
+    async def load_fees(self):
         # loading fees
         # max 10 tickers per connection
         self.pair_to_fee = {}
@@ -230,27 +256,6 @@ class Overman:
             for data_unit in data:
                 pair = self.tickers_to_pairs[data_unit['symbol']]
                 self.pair_to_fee[pair] = Decimal(data_unit['takerFeeRate'])
-
-        # starting to listen sockets
-        # max 100 tickers per connection
-        ticker_chunks = utils.chunk(self.tickers_to_pairs.keys(), 50)
-
-        tasks = [
-            asyncio.create_task(self.monitor_socket(ch))
-            for ch in ticker_chunks
-        ]
-        tasks.append(
-            asyncio.create_task(self.status_monitor())
-        )
-
-        self.result_logger.info('Start trading')
-        try:
-            await asyncio.gather(*tasks)
-        except asyncio.CancelledError:
-            await self.session.close()
-        self.result_logger.info('End trading')
-        # edit graph
-        # trade if graph gave a signal
 
     async def monitor_socket(self, subs: tuple[str]):
         url = f"wss://ws-api-spot.kucoin.com/?token={await self.token()}"
@@ -474,20 +479,20 @@ class Overman:
         start_time = time.time()
         first_quote_coin = cycle.q[0][0].value
         current_balance = self.current_balance[first_quote_coin]
-        predicted_sizes = self.predict_cycle_parameters(cycle)
+        predicted_units = self.predict_cycle_parameters(cycle)
 
-        _, start_min, start_max = predicted_sizes[0]
-        if start_min > start_max:
+        start_unit = predicted_units[0]
+        if start_unit.min_size > start_unit.max_size:
             return TradeCycleResult(
                 cycle=cycle,
                 profit_koef=profit_koef,
                 profit_time=profit_time,
                 started=False,
                 balance_difference=Decimal(0),
-                fail_reason=f'Start min greater than start max: {start_min} > {start_max}'
+                fail_reason=f'Start min greater than start max: {start_unit.min_size} > {start_unit.max_size}'
             )
-        start_min_balance = start_min * cycle[0][1].original_price
-        start_max_balance = start_max * cycle[0][1].original_price
+        start_min_balance = start_unit.min_size * cycle[0][1].original_price
+        start_max_balance = start_unit.max_size * cycle[0][1].original_price
         start_amort_balance = current_balance * Decimal(0.3)
 
         real_start = start_min_balance
@@ -508,61 +513,53 @@ class Overman:
                 fail_reason=f'Start balance greater than balance: {real_start} > {current_balance}'
             )
 
-        for (origin_node, edge, dest_node), (is_sell_phase, size_min, size_max) in zip(cycle.iter_by_pairs(),
-                                                                                       predicted_sizes):
+        for predict_unit in predicted_units:
             self.logger.info(
                 '%s %s %s min %s max %s',
-                'sell' if is_sell_phase else 'buy',
-                origin_node.value,
-                dest_node.value,
-                size_min,
-                size_max,
+                'sell' if predict_unit.is_sell_phase else 'buy',
+                predict_unit.origin_coin,
+                predict_unit.dest_coin,
+                predict_unit.min_size,
+                predict_unit.max_size,
             )
         # PREDICT END
         # START SEGMENTATION
         curr_segment = None
         segments = []
-        for cycle_data, predict_data in zip(cycle.iter_by_pairs(), predicted_sizes):
-            origin_node, edge, dest_node = cycle_data
-            is_sell_phase, size_min, size_max = predict_data
+        for predict_unit in predicted_units:
 
-            is_buy_phase = not is_sell_phase
+            is_buy_phase = not predict_unit.is_sell_phase
             if is_buy_phase:
-                need_balance = size_min * edge.original_price
+                need_balance = predict_unit.target_size * predict_unit.price
             else:
-                need_balance = size_min
+                need_balance = predict_unit.target_size
 
-            if self.current_balance.get(origin_node.value, 0) >= need_balance:
+            coin_balance = self.current_balance.get(predict_unit.origin_coin, 0)
+            if coin_balance >= need_balance:
                 curr_segment = []
                 segments.append(curr_segment)
-            curr_segment.append((
-                origin_node, edge, dest_node,
-                is_sell_phase, size_min, size_max
-            ))
+            curr_segment.append(predict_unit)
 
         self.logger.info(
             'Cycle with len %s splited for %s segments: %s',
             len(cycle), len(segments), ', '.join(str(len(s)) for s in segments)
         )
         for seg in segments:
-            self.logger.warning(list(f'({on.value} -> {dn.value})' for on, _, dn, _, _, _ in seg))
+            self.logger.warning(list(f'({unit.origin_coin} -> {unit.dest_coin})' for unit in seg))
 
-        done, pending = await asyncio.wait(
-            [self.trade_segment(seg) for seg in segments]
+        results = await asyncio.gather(
+            *(self.trade_segment(seg) for seg in segments),
+            return_exceptions=True
         )
-        if pending:
-            self.logger.warning('Pending set is not empty! %s', pending)
 
         no_exceptions = True
         seg_results = []
-        for task in done:
-            try:
-                seg_result: TradeSegmentResult = task.result()
-            except Exception as e:
-                self.logger.error('Catch error from segment:', exc_info=e)
+        for result in results:
+            if isinstance(result, BaseException):
+                self.logger.error('Catch error from segment:', exc_info=result)
                 no_exceptions = False
             else:
-                seg_results.append(seg_result)
+                seg_results.append(result)
 
         if no_exceptions:
             start_balance = seg_results[0].start_balance
@@ -774,10 +771,11 @@ class Overman:
             trade_unit: TradeUnit
     ) -> tuple[Decimal, Decimal]:
         self.logger.info(
-            '[%s -> %s] Start. (price: %s; size: %s, funds: %s)',
+            '[%s -> %s] Start. (price: %s; size: %s, funds: %s, %s)',
             trade_unit.origin_coin, trade_unit.dest_coin,
             trade_unit.price, trade_unit.target_size,
-            trade_unit.price * trade_unit.target_size
+            trade_unit.price * trade_unit.target_size,
+            'sell' if trade_unit.is_sell_phase else 'buy'
         )
         if trade_unit.is_sell_phase:
             base_coin = trade_unit.origin_coin
@@ -804,7 +802,55 @@ class Overman:
 
         if order_result['cancelExist']:
             raise OrderCanceledError(
-                f'[{quote_coin} -> {base_coin}] '
+                f'[{trade_unit.origin_coin} -> {trade_unit.dest_coin}] '
+                f'Order is canceled! Cycle Broken.'
+            )
+
+        fee = Decimal(order_result['fee'])
+        real_size = Decimal(order_result['dealSize'])
+        real_funds = Decimal(order_result['dealFunds'])
+
+        if trade_unit.is_sell_phase:
+            self.logger.info('Real Fee: %s', fee / real_funds)
+            pair_info = self.pairs_info[(base_coin, quote_coin)]
+            quote_increment = Decimal(pair_info.quoteIncrement)
+
+            real_funds = real_funds - fee.quantize(quote_increment)
+        else:
+            # fee is not work, idk :P
+            pass
+
+        self.logger.info('[%s -> %s] OK', quote_coin, base_coin)
+        return real_size, real_funds
+
+    async def trade_pair_hf(
+            self,
+            trade_unit: TradeUnit
+    ) -> tuple[Decimal, Decimal]:
+        self.logger.info(
+            '[%s -> %s] Start. (price: %s; size: %s, funds: %s, %s)',
+            trade_unit.origin_coin, trade_unit.dest_coin,
+            trade_unit.price, trade_unit.target_size,
+            trade_unit.price * trade_unit.target_size,
+            'sell' if trade_unit.is_sell_phase else 'buy'
+        )
+        if trade_unit.is_sell_phase:
+            base_coin = trade_unit.origin_coin
+            quote_coin = trade_unit.dest_coin
+        else:
+            base_coin = trade_unit.dest_coin
+            quote_coin = trade_unit.origin_coin
+
+        order_result = await self.hf_order(
+            base_coin=base_coin,
+            quote_coin=quote_coin,
+            price=str(trade_unit.price),
+            size=str(trade_unit.target_size),
+        )
+
+        if float(order_result['canceledSize']) > 0:
+            raise OrderCanceledError(
+                f'[{trade_unit.origin_coin} -> {trade_unit.dest_coin}] '
                 f'Order is canceled! Cycle Broken.'
             )
 
@@ -860,6 +906,76 @@ class Overman:
         )
         return data['orderId']
 
+    async def hf_order(
+            self,
+            base_coin: BaseCoin | QuoteCoin,
+            quote_coin: QuoteCoin | BaseCoin,
+            price: str,
+            size: str
+    ) -> dict[str, str]:
+        endpoint = '/api/v1/hf/orders/sync'
+
+        if ticker := self.pairs_to_tickers.get((base_coin, quote_coin)):
+            trade_side = 'buy'
+        elif ticker := self.pairs_to_tickers.get((quote_coin, base_coin)):
+            trade_side = 'sell'
+        else:
+            raise Exception(f'Pair {base_coin} - {quote_coin} does not exist!')
+
+        data = await self.do_request(
+            'POST',
+            endpoint,
+            data={
+                'clientOid': str(self.next_uuid()),
+                'side': trade_side,
+                'symbol': ticker,
+                'price': price,
+                'size': size,
+                # optional
+                'type': 'limit',
+                'tradeType': 'TRADE',
+                'timeInForce': 'FOK',
+                # 'timeInForce': 'IOC',
+            },
+            private=True
+        )
+        return data
+
+    async def market_order(
+            self,
+            base_coin: BaseCoin | QuoteCoin,
+            quote_coin: QuoteCoin | BaseCoin,
+            size: str
+    ) -> str:
+        endpoint = '/api/v1/orders'
+
+        if ticker := self.pairs_to_tickers.get((base_coin, quote_coin)):
+            trade_side = 'buy'
+        elif ticker := self.pairs_to_tickers.get((quote_coin, base_coin)):
+            trade_side = 'sell'
+        else:
+            raise Exception(f'Pair {base_coin} - {quote_coin} does not exist!')
+
+        data = {
+            'clientOid': str(self.next_uuid()),
+            'side': trade_side,
+            'symbol': ticker,
+            # optional
+            'type': 'market',
+            'tradeType': 'TRADE',
+        }
+        if trade_side == 'buy':
+            data['size'] = size
+        else:
+            data['size'] = size
+        resp = await self.do_request(
+            'POST',
+            endpoint,
+            data=data,
+            private=True
+        )
+        return resp['orderId']
+
     async def do_request(
             self,
             method: Literal['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'HEAD', 'PATCH'],
@@ -906,14 +1022,16 @@ class Overman:
                                   resp.status, url, await resp.read())
                 raise Exception('bad request')
             data_json = await resp.json()
-            match data_json['code']:
-                case '200000':
-                    return data_json['data']
-                case '200004':
-                    raise BalanceInsufficientError(data_json['msg'])
-                case '400100':
-                    if 'Order size below the minimum requirement' in data_json['msg']:
-                        raise OrderSizeTooSmallError(data_json['msg'])
+            resp_code = int(data_json['code'])
+
+            if resp_code == 200000:
+                return data_json['data']
+            if resp_code == 200004:
+                raise BalanceInsufficientError(data_json['msg'])
+            if resp_code == 400100:
+                if 'Order size below the minimum requirement' in data_json['msg']:
+                    raise OrderSizeTooSmallError(data_json['msg'])
+
             self.logger.error(
                 'Catch %s API code while %s: %s',
                 data_json['code'], url, data_json['msg']
@@ -979,6 +1097,25 @@ class Overman:
         return await self.do_request(
             'GET', '/api/v1/trade-fees',
             params={'symbols': ','.join(symbols)},
+            private=True,
+        )
+
+    async def inner_transfer(
+            self,
+            currency: str,
+            from_: str,
+            to: str,
+            amount: str,
+    ) -> list[dict[str, Any]]:
+        return await self.do_request(
+            'POST', '/api/v2/accounts/inner-transfer',
+            data={
+                'clientOid': str(self.next_uuid()),
+                'currency': currency,
+                'from': from_,
+                'to': to,
+                'amount': amount,
+            },
             private=True,
         )
 
