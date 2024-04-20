@@ -6,3 +6,4 @@ coloredlogs~=15.0.1
 orjson~=3.9.7
 aiohttp~=3.8.5
 PyYAML~=6.0.1
+asciichartpy

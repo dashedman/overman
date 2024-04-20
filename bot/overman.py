@@ -6,6 +6,7 @@ import json
 import time
 import uuid
 from collections import defaultdict
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime
 from functools import cached_property
@@ -14,6 +15,7 @@ from typing import Literal, Any, NewType
 from decimal import Decimal, ROUND_UP
 
 import aiohttp as aiohttp
+import asciichartpy
 import orjson as orjson
 import websockets
 from tqdm import tqdm
@@ -136,6 +138,7 @@ class Overman:
         self.current_balance: dict[str, Decimal] = {}
 
         self.status_bar = tqdm()
+        self.chart_data = ContextVar('chart_data')
 
     @cached_property
     def session(self):
@@ -522,6 +525,7 @@ class Overman:
                 predict_unit.min_size,
                 predict_unit.max_size,
             )
+        self.display_cycle_chart(predicted_units, current_balance)
         # PREDICT END
         # START SEGMENTATION
         curr_segment = None
@@ -547,6 +551,7 @@ class Overman:
         for seg in segments:
             self.logger.warning(list(f'({unit.origin_coin} -> {unit.dest_coin})' for unit in seg))
 
+        return
         results = await asyncio.gather(
             *(self.trade_segment(seg) for seg in segments),
             return_exceptions=True
@@ -1281,3 +1286,53 @@ class Overman:
             )
             await self.update_balance()
             await asyncio.sleep(60)
+
+    def display_cycle_chart(self, predicted_units: list[TradeUnit], current_balance: Decimal):
+        min_sizes = []
+        max_sizes = []
+        prices = []
+        target_sizes = []
+        base_increments = []
+        quote_increments = []
+        funds = []
+
+        for tu in predicted_units:
+            min_sizes.append(tu.min_size)
+            max_sizes.append(tu.max_size)
+            prices.append(tu.price)
+            target_sizes.append(tu.target_size)
+
+            if tu.is_sell_phase:
+                base_coin = tu.origin_coin
+                quote_coin = tu.dest_coin
+            else:
+                base_coin = tu.dest_coin
+                quote_coin = tu.origin_coin
+            pair_info = self.pairs_info[(base_coin, quote_coin)]
+            base_increments.append(pair_info.baseIncrement)
+            quote_increments.append(pair_info.quoteIncrement)
+            funds.append(pair_info.minFunds)
+        plot = asciichartpy.plot(
+            [
+                min_sizes,
+                max_sizes,
+                prices,
+                target_sizes,
+                base_increments,
+                quote_increments,
+                funds
+            ],
+            {
+                'colors': [
+                    asciichartpy.red,
+                    asciichartpy.red,
+                    asciichartpy.yellow,
+                    asciichartpy.white,
+                    asciichartpy.blue,
+                    asciichartpy.blue,
+                    asciichartpy.cyan,
+                ]
+            }
+        )
+        print(plot)
+        print()
