@@ -52,6 +52,42 @@ class PairInfo:
     isMarginEnabled: bool
     enableTrading: bool
 
+    @property
+    def base_min_size(self):
+        return Decimal(self.baseMinSize)
+
+    @property
+    def quote_min_size(self):
+        return Decimal(self.quoteMinSize)
+
+    @property
+    def base_max_size(self):
+        return Decimal(self.baseMaxSize)
+
+    @property
+    def quote_max_size(self):
+        return Decimal(self.quoteMaxSize)
+
+    @property
+    def base_increment(self):
+        return Decimal(self.baseIncrement)
+
+    @property
+    def quote_increment(self):
+        return Decimal(self.quoteIncrement)
+
+    @property
+    def price_increment(self):
+        return Decimal(self.priceIncrement)
+
+    @property
+    def quote_limit_rate(self):
+        return Decimal(self.priceLimitRate)
+
+    @property
+    def min_funds(self):
+        return Decimal(self.minFunds)
+
 
 @dataclass(kw_only=True)
 class TradeUnit:
@@ -483,6 +519,7 @@ class Overman:
         first_quote_coin = cycle.q[0][0].value
         current_balance = self.current_balance[first_quote_coin]
         predicted_units = self.predict_cycle_parameters(cycle)
+        self.display_cycle_chart(predicted_units, current_balance)
 
         start_unit = predicted_units[0]
         if start_unit.min_size > start_unit.max_size:
@@ -525,7 +562,6 @@ class Overman:
                 predict_unit.min_size,
                 predict_unit.max_size,
             )
-        self.display_cycle_chart(predicted_units, current_balance)
         # PREDICT END
         # START SEGMENTATION
         curr_segment = None
@@ -693,8 +729,8 @@ class Overman:
                 fixed_pair = (base_coin, quote_coin)
             pair_info = self.pairs_info[fixed_pair]
 
-            size_increment = Decimal(pair_info.baseIncrement)
-            quote_increment = Decimal(pair_info.quoteIncrement)
+            size_increment = pair_info.base_increment
+            quote_increment = pair_info.quote_increment
 
             if trade_unit.is_sell_phase:
                 if prev_phase_is_sell:
@@ -818,9 +854,8 @@ class Overman:
         if trade_unit.is_sell_phase:
             self.logger.info('Real Fee: %s', fee / real_funds)
             pair_info = self.pairs_info[(base_coin, quote_coin)]
-            quote_increment = Decimal(pair_info.quoteIncrement)
 
-            real_funds = real_funds - fee.quantize(quote_increment)
+            real_funds = real_funds - fee.quantize(pair_info.quote_increment)
         else:
             # fee is not work, idk :P
             pass
@@ -866,9 +901,8 @@ class Overman:
         if trade_unit.is_sell_phase:
             self.logger.info('Real Fee: %s', fee / real_funds)
             pair_info = self.pairs_info[(base_coin, quote_coin)]
-            quote_increment = Decimal(pair_info.quoteIncrement)
 
-            real_funds = real_funds - fee.quantize(quote_increment)
+            real_funds = real_funds - fee.quantize(pair_info.quote_increment)
         else:
             # fee is not work, idk :P
             pass
@@ -1292,47 +1326,60 @@ class Overman:
         max_sizes = []
         prices = []
         target_sizes = []
-        base_increments = []
-        quote_increments = []
-        funds = []
+        acc_prices = []
+        acc_price = 1
 
         for tu in predicted_units:
-            min_sizes.append(tu.min_size)
-            max_sizes.append(tu.max_size)
+            acc_price *= tu.price
+            acc_prices.append(acc_price)
             prices.append(tu.price)
             target_sizes.append(tu.target_size)
 
             if tu.is_sell_phase:
+                min_sizes.append(tu.min_size / acc_price)
+                max_sizes.append(tu.max_size / acc_price)
+                target_sizes.append(tu.target_size * acc_price)
+                prices.append(tu.price)
+
                 base_coin = tu.origin_coin
                 quote_coin = tu.dest_coin
             else:
+                min_sizes.append(tu.min_size * acc_price)
+                max_sizes.append(tu.max_size * acc_price)
+                target_sizes.append(tu.target_size * acc_price)
+                prices.append(tu.price)
+
                 base_coin = tu.dest_coin
                 quote_coin = tu.origin_coin
-            pair_info = self.pairs_info[(base_coin, quote_coin)]
-            base_increments.append(pair_info.baseIncrement)
-            quote_increments.append(pair_info.quoteIncrement)
-            funds.append(pair_info.minFunds)
-        plot = asciichartpy.plot(
+
+        plot_sizes = asciichartpy.plot(
             [
                 min_sizes,
                 max_sizes,
-                prices,
                 target_sizes,
-                base_increments,
-                quote_increments,
-                funds
             ],
             {
                 'colors': [
+                    asciichartpy.green,
                     asciichartpy.red,
-                    asciichartpy.red,
-                    asciichartpy.yellow,
                     asciichartpy.white,
-                    asciichartpy.blue,
-                    asciichartpy.blue,
-                    asciichartpy.cyan,
-                ]
+                ],
+                'height': 20
             }
         )
-        print(plot)
+        plot_prices = asciichartpy.plot(
+            [
+                prices,
+                acc_prices,
+            ],
+            {
+                'colors': [
+                    asciichartpy.white,
+                    asciichartpy.yellow,
+                ],
+                'height': 20
+            }
+        )
+        print(plot_sizes)
+        print(plot_prices)
         print()
