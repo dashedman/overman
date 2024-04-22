@@ -1322,36 +1322,24 @@ class Overman:
             await asyncio.sleep(60)
 
     def display_cycle_chart(self, predicted_units: list[TradeUnit], current_balance: Decimal):
-        min_sizes = []
-        max_sizes = []
-        prices = []
-        target_sizes = []
-        acc_prices = []
-        acc_price = 1
 
+        # generate chart data
+        chart_data_unit = []
         for tu in predicted_units:
-            acc_price *= tu.price
-            acc_prices.append(acc_price)
-            prices.append(tu.price)
-            target_sizes.append(tu.target_size)
-
-            if tu.is_sell_phase:
-                min_sizes.append(tu.min_size / acc_price)
-                max_sizes.append(tu.max_size / acc_price)
-                target_sizes.append(tu.target_size * acc_price)
-                prices.append(tu.price)
-
-                base_coin = tu.origin_coin
-                quote_coin = tu.dest_coin
-            else:
-                min_sizes.append(tu.min_size * acc_price)
-                max_sizes.append(tu.max_size * acc_price)
-                target_sizes.append(tu.target_size * acc_price)
-                prices.append(tu.price)
-
-                base_coin = tu.dest_coin
-                quote_coin = tu.origin_coin
-
+            ticker = (
+                self.pairs_to_tickers.get((tu.origin_coin, tu.dest_coin))
+                or self.pairs_to_tickers.get((tu.dest_coin, tu.origin_coin))
+            )
+            order_book = self.order_book_by_ticker[ticker]
+            for _ in order_book.:
+            chart_data_unit.append()
+        # save chart data to history
+        chart_history = self.chart_data.get()
+        if len(chart_history) >= 5:
+            chart_history.pop(0)
+        chart_history.append(chart_data_unit)
+        # draw chart data
+        # print chart data
         plot_sizes = asciichartpy.plot(
             [
                 min_sizes,
