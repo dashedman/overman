@@ -1,0 +1,13 @@
+[package]
+name = "graph-rs"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+name = "graph_rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.21.2", features = ["rust_decimal"] }
+rust_decimal = "1.35.0"

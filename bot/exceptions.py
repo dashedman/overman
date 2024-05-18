@@ -15,7 +15,12 @@ class OrderSizeTooSmallError(RequestException):
 
 
 class OrderCanceledError(RequestException):
-    pass
+    def __init__(self, msg, size=None):
+        self.msg = msg
+        self.size = size
+
+    def __str__(self):
+        return self.msg + f'(size: {self.size})'
 
 
 class PredictionException(OvermanException):

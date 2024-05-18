@@ -4,6 +4,6 @@ requests~=2.31.0
 coloredlogs~=15.0.1
 
 orjson~=3.9.7
-aiohttp~=3.8.5
+aiohttp
 PyYAML~=6.0.1
 asciichartpy

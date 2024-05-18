@@ -3,6 +3,7 @@ import base64
 import hashlib
 import hmac
 import json
+import random
 import time
 import uuid
 from collections import defaultdict
@@ -12,12 +13,13 @@ from datetime import datetime
 from functools import cached_property
 from itertools import chain
 from typing import Literal, Any, NewType
-from decimal import Decimal, ROUND_UP
+from decimal import Decimal, ROUND_UP, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_DOWN
 
 import aiohttp as aiohttp
 import asciichartpy
 import orjson as orjson
 import websockets
+from graph_rs import EdgeRS
 from tqdm import tqdm
 
 import bot.logger
@@ -98,6 +100,28 @@ class TradeUnit:
     min_size: Decimal
     max_size: Decimal
     target_size: Decimal
+    funds_info: Decimal | None = None
+
+    def get_base_quote(self) -> tuple[BaseCoin, QuoteCoin]:
+        if self.is_sell_phase:
+            base_coin = self.origin_coin
+            quote_coin = self.dest_coin
+        else:
+            base_coin = self.dest_coin
+            quote_coin = self.origin_coin
+        return base_coin, quote_coin
+
+    def clone(self):
+        return TradeUnit(
+            origin_coin=self.origin_coin,
+            dest_coin=self.dest_coin,
+            price=self.price,
+            is_sell_phase=self.is_sell_phase,
+            min_size=self.min_size,
+            max_size=self.max_size,
+            target_size=self.target_size,
+            funds_info=self.funds_info,
+        )
 
 
 @dataclass(kw_only=True)
@@ -123,7 +147,7 @@ class TradeCycleResult:
             f'started: {self.started}, '
             f'balance_difference: {self.balance_difference}'
         ) + (
-            f', ttime: {self.trade_time:.3f}' if self.trade_time else ''
+            f', ttime: {self.trade_time:.4f}' if self.trade_time else ''
         ) + (
             f', overhauls: {self.overhauls}' if self.overhauls is not None else ''
         ) + (
@@ -141,30 +165,53 @@ class TradeSegmentResult:
     trade_time: float = 0
 
 
+@dataclass(kw_only=True)
+class ObserveUnit:
+    trade_unit: TradeUnit
+    order_book_history: list[dto.BestOrders]
+
+
+@dataclass(kw_only=True)
+class ObserveSequence:
+    observes: list[ObserveUnit]
+
+
 class Overman:
     graph: Graph
     loop: asyncio.AbstractEventLoop
+    stat_counter: int = 0
+    start_running: float = -1
     tickers_to_pairs: dict[str, tuple[str, str]]
     pairs_to_tickers: dict[tuple[str, str], str]
     pairs_info: dict[tuple[str, str], PairInfo]
     pair_to_fee: dict[tuple[str, str], Decimal]
+    done_orders: dict[str, Any]
+    canceled_orders: dict[str, Any]
+    hf_trade: bool
 
     def __init__(
             self,
             pivot_coins: list[str],
             depth: Literal[1, 50],
-            prefix: str
+            prefix: str,
+            hf_trade: bool = False,
     ):
         self.depth = depth
         self.prefix = prefix
         self.pivot_coins = pivot_coins
+        self.hf_trade = hf_trade
 
         self.order_book_by_ticker: dict[str, 'dto.BestOrders'] = {}
         self.__token = None
+        self.__private_token = None
         self._ping_interval = None
         self._ping_timeout = None
+        self._private_ping_interval = None
+        self._private_ping_timeout = None
+        self.server_time_correction = 0
         self._ws_id = 0
         self.is_on_trade: bool = False
+        self.was_traded = False
 
         self.config = Config.read_config('../config.yaml')
 
@@ -172,9 +219,10 @@ class Overman:
         self.profit_life_start = 0
 
         self.current_balance: dict[str, Decimal] = {}
+        self.done_orders = {}
+        self.canceled_orders = {}
 
-        self.status_bar = tqdm()
-        self.chart_data = ContextVar('chart_data')
+        self.status_bar = tqdm(colour='green')
 
     @cached_property
     def session(self):
@@ -204,16 +252,37 @@ class Overman:
             "response": True
         }
 
+    @staticmethod
+    def prepare_orders_topic():
+        return {
+            "id": "test2",
+            "type": "subscribe",
+            "topic": "/spotMarket/tradeOrders",
+            "response": True,
+            "privateChannel": True,
+        }
+
     async def token(self):
         if self.__token is None:
             await self.reload_token()
         return self.__token
+
+    async def private_token(self):
+        if self.__private_token is None:
+            await self.reload_private_token()
+        return self.__private_token
 
     async def reload_token(self):
         data = await self.do_request('POST', '/api/v1/bullet-public')
         self.__token = data['token']
         self._ping_interval = data['instanceServers'][0]['pingInterval'] / 1000   # to sec
         self._ping_timeout = data['instanceServers'][0]['pingTimeout'] / 1000   # to sec
+
+    async def reload_private_token(self):
+        data = await self.do_request('POST', '/api/v1/bullet-private', private=True)
+        self.__private_token = data['token']
+        self._private_ping_interval = data['instanceServers'][0]['pingInterval'] / 1000   # to sec
+        self._private_ping_timeout = data['instanceServers'][0]['pingTimeout'] / 1000   # to sec
 
     @staticmethod
     def next_uuid():
@@ -234,6 +303,7 @@ class Overman:
         self.logger.info('Loading graph')
         self.loop = asyncio.get_running_loop()
 
+        await self.calibrate_server_time()
         await self.load_tickers()
         await self.load_fees()
 
@@ -246,10 +316,14 @@ class Overman:
             for ch in ticker_chunks
         ]
         tasks.append(
+            asyncio.create_task(self.orders_socket())
+        )
+        tasks.append(
             asyncio.create_task(self.status_monitor())
         )
 
         self.result_logger.info('Start trading')
+        self.start_running = time.time()
         try:
             await asyncio.gather(*tasks)
         except asyncio.CancelledError:
@@ -257,6 +331,16 @@ class Overman:
         self.result_logger.info('End trading')
         # edit graph
         # trade if graph gave a signal
+
+    async def calibrate_server_time(self):
+        start_time = int(time.time() * 1000)
+        server_time = await self.do_request('GET', '/api/v1/timestamp')
+        end_time = int(time.time() * 1000)
+
+        my_time = (start_time + end_time) // 2
+        self.server_time_correction = (server_time - my_time) // 2
+        self.logger.info('Server timestamp %s, Local timestamp %s, Time Correction %s',
+                         server_time, my_time, self.server_time_correction)
 
     async def load_tickers(self):
         pairs_raw = await self.do_request('GET', '/api/v2/symbols')
@@ -278,7 +362,7 @@ class Overman:
         self.logger.info(
             'Loaded %s pairs, nodes: %s, edges: %s.',
             len(pairs), len(self.graph),
-            sum(len(node.edges) for node in self.graph)
+            sum(len(node.edges) for node in self.graph.nodes)
         )
 
     async def load_fees(self):
@@ -286,6 +370,17 @@ class Overman:
         # max 10 tickers per connection
         self.pair_to_fee = {}
         ticker_chunks = utils.chunk(self.tickers_to_pairs.keys(), 150)
+
+        while True:
+            self.logger.info('Trying to get first fees info.')
+            try:
+                data = await self.get_trade_fees(ticker_chunks[0][:1])
+                if data:
+                    break
+            except Exception as e:
+                self.logger.warning(f'Catch {e}. Trying again. Sleep 60 sec')
+            await asyncio.sleep(60)
+
         for chunks in tqdm(ticker_chunks, postfix='fees loaded', ascii=True):
             data_chunks = await asyncio.gather(*(
                 self.get_trade_fees(subchunk)
@@ -337,6 +432,76 @@ class Overman:
             except websockets.ConnectionClosed as e:
                 self.logger.error('websocket error: %s', e)
 
+    async def orders_socket(self):
+        url = f"wss://ws-api-spot.kucoin.com/?token={await self.private_token()}"
+        async for sock in websockets.connect(url, ping_interval=None):
+            try:
+                last_ping = time.time()
+
+                subscribe_msg = self.prepare_orders_topic()
+                subscribe_msg_raw = json.dumps(subscribe_msg)
+                await sock.send(subscribe_msg_raw)
+
+                while True:
+                    try:
+                        try:
+                            async with asyncio.timeout(self._private_ping_interval * 0.2):
+                                order_result_raw: str = await sock.recv()
+                        except TimeoutError:
+                            pass
+                        else:
+                            order_result: dict = json.loads(order_result_raw)
+                            if order_result.get('code') == 401:
+                                self.logger.info("Token has been expired")
+                                await self.reload_private_token()
+                                self.logger.info("Token reloaded")
+                            else:
+                                if order_result.get('data') is not None:
+                                    self.handle_order_event(order_result)
+                                else:
+                                    # pprint(orderbook)
+                                    pass
+
+                        if last_ping + self._private_ping_interval * 0.8 < time.time():
+                            await sock.send(json.dumps({
+                                'id': str(self.next_ws_id()),
+                                'type': 'ping'
+                            }))
+                            last_ping = time.time()
+                    except websockets.ConnectionClosed as e:
+                        self.logger.error('Catch error from websocket: %s', e, exc_info=e)
+                    except Exception as e:
+                        self.logger.error(
+                            'Catch error while monitoring socket:\n',
+                            exc_info=e)
+                        break
+            except websockets.ConnectionClosed as e:
+                self.logger.error('websocket error: %s', e)
+
+    async def clear_orders_buffers(self):
+        now = time.time()
+        five_min = 5 * 60
+
+        # clear done buffer
+        orders_to_del = []
+        for order_id, order_data in self.done_orders.items():
+            if order_data['receiveTimeSec'] + five_min < now:
+                orders_to_del.append(order_id)
+
+        for order_to_del in orders_to_del:
+            self.logger.info('Del order from "done" buffer: %s', order_to_del)
+            del self.done_orders[order_to_del]
+
+        # clear canceled buffer
+        orders_to_del = []
+        for order_id, order_data in self.canceled_orders.items():
+            if order_data['receiveTimeSec'] + five_min < now:
+                orders_to_del.append(order_id)
+
+        for order_to_del in orders_to_del:
+            self.logger.info('Del order from "canceled" buffer: %s', order_to_del)
+            del self.canceled_orders[order_to_del]
+
     def handle_raw_orderbook_data(
             self,
             raw_orderbook: dict[str, str | dict[str, int | list[list[str]]]]
@@ -357,6 +522,8 @@ class Overman:
          "Bid" (предложение о покупке) - это цена, по которой покупатель готов
           купить определенное количество акций или других ценных бумаг.
         """
+        self.stat_counter += 1
+
         ticker = raw_orderbook['topic'].split(':')[-1]
         ob_data: dict[str, list[list[str]]] = raw_orderbook['data']
         order_book = self.order_book_by_ticker[ticker] = \
@@ -377,6 +544,30 @@ class Overman:
             self.update_graph(pair, ask, fee=pair_fee)
             self.update_graph(pair, bid, fee=pair_fee, inverted=True)
             self.trigger_trade()
+
+    def handle_order_event(
+            self,
+            raw_order_result: dict[str, str | dict[str, int | float | str]]
+    ):
+        order_data = raw_order_result['data']
+        if isinstance(order_data, str):
+            print()
+
+        match order_data['type'], order_data['status']:
+            case 'filled', 'done':
+                order_data['receiveTimeSec'] = time.time()
+                self.done_orders[order_data['orderId']] = order_data
+                self.logger.info('Add order to "done" buffer: %s', order_data['orderId'])
+
+            case 'canceled', 'done':
+                order_data['receiveTimeSec'] = time.time()
+                self.canceled_orders[order_data['orderId']] = order_data
+                self.logger.info('Add order to "canceled" buffer: %s', order_data['orderId'])
+            case _:
+                self.logger.info(
+                    'Catch some order event: %s, %s, %s',
+                    order_data['type'], order_data['status'], order_data['orderId']
+                )
 
     @staticmethod
     def get_order_book_from_raw(ob_data):
@@ -470,56 +661,79 @@ class Overman:
     def get_time_line():
         return datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
 
-    def display(self, info):
-        self.status_bar.display(f'[{self.get_time_line()}|status] {info}\r')
+    def display(self, info, throttling: int = 1):
+        if throttling == random.randint(1, throttling):
+            self.status_bar.display(f'[{self.get_time_line()}|status] {info}')
 
     async def process_trade(self, graph: Graph, copy_time: float):
-        start_calc = time.time()
-        experimental_profit = await self.loop.run_in_executor(
-            None,
-            self.check_profit_experimental_3,
-            graph
-        )
-        end_calc = time.time()
-        if experimental_profit:
-            profit_koef, cycle = experimental_profit
-            profit_time = end_calc - start_calc
+        try:
+            start_calc = time.time()
+            experimental_profit = await self.loop.run_in_executor(
+                None,
+                self.check_profit_experimental_3,
+                graph
+            )
+            end_calc = time.time()
+            if experimental_profit:
+                profit_koef, cycle = experimental_profit
+                profit_time = end_calc - start_calc
 
-            # TIME PRINT
-            # self.display(f'Current profit {profit_koef:.4f}, ct: {profit_time:.5f}')
-            # if profit_koef == self.last_profit:
-            #     pass
-            # else:
-            #     now = time.time()
-            #     if self.last_profit < 1:
-            #         self.result_logger.info('Profit %.4f, lifetime %.5f',
-            #         self.last_profit, now - self.profit_life_start)
-            #     self.last_profit = profit_koef
-            #     self.profit_life_start = now
+                # TIME PRINT
+                # self.display(f'Current profit {profit_koef:.4f}, ct: {profit_time:.5f}')
+                # if profit_koef == self.last_profit:
+                #     pass
+                # else:
+                #     now = time.time()
+                #     if self.last_profit < 1:
+                #         self.result_logger.info('Profit %.4f, lifetime %.5f',
+                #         self.last_profit, now - self.profit_life_start)
+                #     self.last_profit = profit_koef
+                #     self.profit_life_start = now
 
-            # TRADE
-            if profit_koef >= 1:
-                self.display(
-                    f'Current profit {profit_koef:.4f}, '
-                    f'ct: {profit_time:.5f}, copy time: {copy_time:.5f}'
-                )
-            else:
-                res = await self.trade_cycle(cycle, profit_koef, profit_time)
-                if res.balance_difference == 0:
-                    self.display(res.one_line_status())
+                # TRADE
+                if profit_koef >= 1:
+                    self.display(
+                        f'Current profit {profit_koef:.4f}, '
+                        f'ct: {profit_time:.5f}, copy time: {copy_time:.5f}',
+                        throttling=10,
+                    )
                 else:
-                    self.result_logger.info(res.one_line_status())
+                    res = await self.trade_cycle(cycle, profit_koef, profit_time)
+                    if res.balance_difference == 0:
+                        self.display(res.one_line_status(), throttling=2)
+                    else:
+                        self.result_logger.info(res.one_line_status())
 
-                if res.started:
-                    await self.update_balance()
-        self.is_on_trade = False
+                    if res.started:
+                        self.was_traded = True
+                        await self.update_balance()
+        finally:
+            self.is_on_trade = False
 
     async def trade_cycle(self, cycle: Cycle, profit_koef: float, profit_time: float) -> TradeCycleResult:
         start_time = time.time()
+        trade_timeout = 10 * 60  # sec
+
         first_quote_coin = cycle.q[0][0].value
-        current_balance = self.current_balance[first_quote_coin]
-        predicted_units = self.predict_cycle_parameters(cycle)
-        self.display_cycle_chart(predicted_units, current_balance)
+        first_base_coin = cycle.q[1][0].value
+        first_buy_price = cycle.q[0][1].original_price
+        first_pair_info = self.pairs_info[(first_base_coin, first_quote_coin)]
+
+        current_balance = self.current_balance.get(first_quote_coin, 0)
+        prefer_start_funds = min(
+            max(
+                # start = MIN_SIZE * 3
+                3 * first_pair_info.base_min_size * first_buy_price,
+                # start = 5% of balance
+                current_balance / 20
+            ),
+            current_balance
+        )
+
+        predicted_units = self.predict_cycle_parameters(
+            cycle,
+            prefer_start_funds=prefer_start_funds,
+        )
 
         start_unit = predicted_units[0]
         if start_unit.min_size > start_unit.max_size:
@@ -531,18 +745,8 @@ class Overman:
                 balance_difference=Decimal(0),
                 fail_reason=f'Start min greater than start max: {start_unit.min_size} > {start_unit.max_size}'
             )
-        start_min_balance = start_unit.min_size * cycle[0][1].original_price
-        start_max_balance = start_unit.max_size * cycle[0][1].original_price
-        start_amort_balance = current_balance * Decimal(0.3)
 
-        real_start = start_min_balance
-        # real_start = min(
-        #     start_max_balance,
-        #     max(
-        #         start_min_balance,
-        #         start_amort_balance
-        #     )
-        # )
+        real_start = start_unit.funds_info
         if real_start > current_balance:
             return TradeCycleResult(
                 cycle=cycle,
@@ -555,13 +759,17 @@ class Overman:
 
         for predict_unit in predicted_units:
             self.logger.info(
-                '%s %s %s min %s max %s',
+                '%s %s %s min %s max %s target %s funds %s',
                 'sell' if predict_unit.is_sell_phase else 'buy',
                 predict_unit.origin_coin,
                 predict_unit.dest_coin,
                 predict_unit.min_size,
                 predict_unit.max_size,
+                predict_unit.target_size,
+                predict_unit.funds_info,
             )
+
+        self.upkeep_cycle(predicted_units, timeout=trade_timeout)
         # PREDICT END
         # START SEGMENTATION
         curr_segment = None
@@ -587,9 +795,8 @@ class Overman:
         for seg in segments:
             self.logger.warning(list(f'({unit.origin_coin} -> {unit.dest_coin})' for unit in seg))
 
-        return
         results = await asyncio.gather(
-            *(self.trade_segment(seg) for seg in segments),
+            *(self.trade_segment(seg, trade_timeout=trade_timeout) for seg in segments),
             return_exceptions=True
         )
 
@@ -632,6 +839,8 @@ class Overman:
             prefer_start_funds: Decimal = Decimal(0),
     ) -> list[TradeUnit]:
         default_fee = Decimal('0.001')
+        default_rounding = ROUND_HALF_DOWN
+        # default_rounding = ROUND_FLOOR
         predict_results = []
 
         prev_phase_is_sell = False
@@ -644,12 +853,20 @@ class Overman:
         for origin_node, edge, dest_node in cycle.iter_by_pairs_reversed():
             quote_coin = origin_node.value
             base_coin = dest_node.value
-            if edge.inversed:
+            if edge.inverted:
                 fixed_pair = (quote_coin, base_coin)
             else:
                 fixed_pair = (base_coin, quote_coin)
-            pair_info = self.pairs_info[fixed_pair]
-            is_sell_phase = edge.inversed
+
+            try:
+                pair_info = self.pairs_info[fixed_pair]
+            except KeyError:
+                try:
+                    pair_info = self.pairs_info[fixed_pair]
+                except KeyError as e:
+                    print()
+                    raise
+            is_sell_phase = edge.inverted
 
             min_size = Decimal(pair_info.baseMinSize)
             max_size = Decimal(pair_info.baseMaxSize)
@@ -666,12 +883,12 @@ class Overman:
                     min_size,
                     last_min_funds / (1 - default_fee) / edge.original_price,
                     min_funds / edge.original_price
-                ).quantize(size_increment, rounding=ROUND_UP)
+                ).quantize(size_increment, rounding=default_rounding)
                 last_max_sell_size = min(
                     max_size,
                     last_max_funds / (1 - default_fee) / edge.original_price,
                     edge.volume
-                ).quantize(size_increment)
+                ).quantize(size_increment, rounding=default_rounding)
                 predict_results.append(TradeUnit(
                     origin_coin=origin_node.value,
                     dest_coin=dest_node.value,
@@ -691,13 +908,14 @@ class Overman:
                     # last_sell_size / (1 - default_fee),
                     last_min_sell_size,
                     min_funds / edge.original_price
-                ).quantize(size_increment, rounding=ROUND_UP)
+                ).quantize(size_increment, rounding=default_rounding)
                 last_max_buy_size = min(
                     max_size,
                     # last_max_sell_size / (1 - default_fee) / edge.original_price,
-                    last_max_sell_size / edge.original_price,
+                    # last_max_sell_size / edge.original_price,
+                    last_max_sell_size,
                     edge.volume
-                ).quantize(size_increment)
+                ).quantize(size_increment, rounding=default_rounding)
                 predict_results.append(TradeUnit(
                     origin_coin=origin_node.value,
                     dest_coin=dest_node.value,
@@ -709,15 +927,16 @@ class Overman:
                 ))
                 last_min_funds = (
                     last_min_buy_size * edge.original_price
-                ).quantize(quote_increment)
+                ).quantize(quote_increment, rounding=default_rounding)
                 last_max_funds = (
                     last_max_buy_size * edge.original_price
-                ).quantize(quote_increment)
+                ).quantize(quote_increment, rounding=default_rounding)
 
             prev_phase_is_sell = is_sell_phase
 
         # Forward prediction
         predict_results.reverse()
+        prev_phase_is_sell = True
         last_buy_size = Decimal(0)
         last_funds = prefer_start_funds
         for trade_unit in predict_results:
@@ -740,13 +959,15 @@ class Overman:
                     trade_unit.max_size,
                     max(
                         trade_unit.min_size,
-                        last_buy_size / trade_unit.price
+                        # last_buy_size / trade_unit.price,
+                        last_buy_size,
                     )
-                ).quantize(size_increment)
+                ).quantize(size_increment, rounding=default_rounding)
                 last_funds = (
-                        last_sell_size * trade_unit.price * (1 - default_fee)
-                ).quantize(quote_increment)
+                    last_sell_size * trade_unit.price * (1 - default_fee)
+                ).quantize(quote_increment, rounding=default_rounding)
                 trade_unit.target_size = last_sell_size
+                trade_unit.funds_info = last_funds
             else:
                 if not prev_phase_is_sell:
                     last_funds = last_buy_size
@@ -757,225 +978,266 @@ class Overman:
                         trade_unit.min_size,
                         last_funds / trade_unit.price
                     )
-                ).quantize(size_increment)
+                ).quantize(size_increment, rounding=default_rounding)
                 trade_unit.target_size = last_buy_size
+                trade_unit.funds_info = last_funds
 
             prev_phase_is_sell = trade_unit.is_sell_phase
+
+        # fix start's funds
+        first_trade_unit = predict_results[0]
+
+        quote_coin = first_trade_unit.origin_coin
+        base_coin = first_trade_unit.dest_coin
+        if first_trade_unit.is_sell_phase:
+            fixed_pair = (quote_coin, base_coin)
+        else:
+            fixed_pair = (base_coin, quote_coin)
+        pair_info = self.pairs_info[fixed_pair]
+
+        first_trade_unit.funds_info = (
+            first_trade_unit.target_size * first_trade_unit.price
+        ).quantize(pair_info.quote_increment, default_rounding)
 
         return predict_results
 
     async def trade_segment(
             self,
             segment: list[TradeUnit],
+            trade_timeout: int,
     ) -> TradeSegmentResult:
         # prepare
         trade_unit = segment[0]
-        start_balance = trade_unit.min_size if trade_unit.is_sell_phase else trade_unit.min_size * trade_unit.price
+        start_balance = trade_unit.min_size if trade_unit.is_sell_phase else trade_unit.funds_info
         start_time = time.time()
         segment_str = ' -> '.join(
             chain((unit.origin_coin for unit in segment), (segment[-1].dest_coin,))
         )
 
         self.logger.info('Start segment: %s', segment_str)
-        next_size = trade_unit.min_size
 
         # segment rolling
         for trade_unit in segment:
 
-            if next_size != trade_unit.target_size:
-                self.logger.warning(
-                    'Predicted size is not equal to real size. Predict: %s, Real: %s',
-                    trade_unit.target_size, next_size
-                )
+            real_size = Decimal(0)
+            attempts_for_trade = 10
+            timeout_for_attempt = trade_timeout // attempts_for_trade
 
-            try:
-                real_size, real_funds = await self.trade_pair(trade_unit)
-            except BalanceInsufficientError:
-                self.logger.warning('Catch Balance Insufficient Error. Trying again.')
-                real_size, real_funds = await self.trade_pair(trade_unit)
+            # clone trade unit to calibrate some data when trade broken in a half
+            trade_unit_clone = trade_unit.clone()
+            pair_info = self.pairs_info[trade_unit_clone.get_base_quote()]
+            for attempt in range(attempts_for_trade):
+                try:
+                    real_size = await self.trade_pair(
+                        trade_unit_clone,
+                        trade_timeout=timeout_for_attempt,
+                    )
+                except (BalanceInsufficientError, OrderCanceledError) as e:
+                    if attempt < attempts_for_trade - 1:
+                        self.logger.warning('Catch %s. Trying again (%s).', e, attempt)
+                        if isinstance(e, OrderCanceledError):
+                            # calibrate size
+                            old_target_size = trade_unit_clone.target_size
+                            trade_unit_clone.target_size -= e.size
+                            self.logger.info(
+                                'Calibrate target size %s -> %s (-%s, started: %s)',
+                                old_target_size, trade_unit_clone.target_size, e.size, trade_unit.target_size
+                            )
 
-            if trade_unit.is_sell_phase:
-                next_size = real_funds / trade_unit.price
-            else:
-                next_size = real_size
+                            if trade_unit_clone.target_size < pair_info.base_min_size:
+                                self.logger.warning('Calibrated target size below min required size. Do next trade..')
+                                real_size = trade_unit.target_size - trade_unit_clone.target_size
+                                break
+
+                    else:
+                        raise e
+                else:
+                    break
 
         self.logger.info('End segment: %s', segment_str)
         return TradeSegmentResult(
             segment=segment,
             start_balance=start_balance,
-            end_balance=next_size,
+            end_balance=real_size * trade_unit.price,
             trade_time=time.time() - start_time
         )
 
     async def trade_pair(
             self,
-            trade_unit: TradeUnit
-    ) -> tuple[Decimal, Decimal]:
+            trade_unit: TradeUnit,
+            trade_timeout: int = 0,
+    ) -> Decimal:
+        start_trade_time = time.time()
         self.logger.info(
-            '[%s -> %s] Start. (price: %s; size: %s, funds: %s, %s)',
+            f'[%s -> %s] Start{" HF" if self.hf_trade else ""}. (price: %s; size: %s, funds: %s, %s)',
             trade_unit.origin_coin, trade_unit.dest_coin,
             trade_unit.price, trade_unit.target_size,
             trade_unit.price * trade_unit.target_size,
             'sell' if trade_unit.is_sell_phase else 'buy'
         )
-        if trade_unit.is_sell_phase:
-            base_coin = trade_unit.origin_coin
-            quote_coin = trade_unit.dest_coin
+        base_coin, quote_coin = trade_unit.get_base_quote()
+        ticker = self.pairs_to_tickers[(base_coin, quote_coin)]
+
+        if self.hf_trade:
+            order_result = await self.create_hf_order(
+                base_coin=base_coin,
+                quote_coin=quote_coin,
+                price=str(trade_unit.price),
+                size=str(trade_unit.target_size),
+                is_sell=trade_unit.is_sell_phase,
+                time_in_force='GTT',
+                cancel_after=trade_timeout,
+            )
+            order_id = order_result['orderId']
+            order_is_active = order_result['status'] == 'open'
         else:
-            base_coin = trade_unit.dest_coin
-            quote_coin = trade_unit.origin_coin
+            order_id = await self.create_order(
+                base_coin=base_coin,
+                quote_coin=quote_coin,
+                price=str(trade_unit.price),
+                size=str(trade_unit.target_size),
+                is_sell=trade_unit.is_sell_phase,
+                time_in_force='GTT',
+                cancel_after=trade_timeout,
+            )
+            order_result = None
+            order_is_active = True
 
-        order_id = await self.create_order(
-            base_coin=base_coin,
-            quote_coin=quote_coin,
-            price=str(trade_unit.price),
-            size=str(trade_unit.target_size),
-        )
-
-        order_is_active = True
-        order_result = None
         while order_is_active:
-            order_result = await self.get_order(order_id)
+
+            if order_id in self.done_orders:
+                order_result_ws = self.done_orders[order_id]
+                order_result = {
+                    'dealSize': order_result_ws['filledSize']
+                }
+                break
+            elif order_id in self.canceled_orders:
+                order_result_ws = self.canceled_orders[order_id]
+                order_result = {
+                    'dealSize': order_result_ws['filledSize'],
+                    'cancelExist': True,
+                }
+                break
+            else:
+                await asyncio.sleep(0)
+                continue
+                order_result = await self.get_order(order_id, ticker=ticker)
             # self.logger.info(f'{order_result}')
-            order_is_active = order_result['isActive']
+            if order_result is None:
+                self.logger.warning('Catch None from get_order(%s, %s)!', order_id, ticker)
+                continue
+
+            order_is_active = order_result.get('active') or order_result.get('isActive')
+
             if order_is_active:
-                self.logger.info('[%s -> %s] Order is active for now! Waiting...')
+                self.display(
+                    f'[{trade_unit.origin_coin} -> {trade_unit.dest_coin}] '
+                    f'Order is active for now! Waiting timeout ({trade_timeout})...',
+                    throttling=3
+                )
 
-        if order_result['cancelExist']:
+        real_size = Decimal(order_result['dealSize'])
+
+        if order_result.get('cancelExist', False):
             raise OrderCanceledError(
                 f'[{trade_unit.origin_coin} -> {trade_unit.dest_coin}] '
-                f'Order is canceled! Cycle Broken.'
+                f'Order is canceled! Cycle Broken. ',
+                real_size,
             )
 
-        fee = Decimal(order_result['fee'])
-        real_size = Decimal(order_result['dealSize'])
-        real_funds = Decimal(order_result['dealFunds'])
-
-        if trade_unit.is_sell_phase:
-            self.logger.info('Real Fee: %s', fee / real_funds)
-            pair_info = self.pairs_info[(base_coin, quote_coin)]
-
-            real_funds = real_funds - fee.quantize(pair_info.quote_increment)
-        else:
-            # fee is not work, idk :P
-            pass
-
-        self.logger.info('[%s -> %s] OK', quote_coin, base_coin)
-        return real_size, real_funds
-
-    async def trade_pair_hf(
-            self,
-            trade_unit: TradeUnit
-    ) -> tuple[Decimal, Decimal]:
         self.logger.info(
-            '[%s -> %s] Start. (price: %s; size: %s, funds: %s, %s)',
-            trade_unit.origin_coin, trade_unit.dest_coin,
-            trade_unit.price, trade_unit.target_size,
-            trade_unit.price * trade_unit.target_size,
-            'sell' if trade_unit.is_sell_phase else 'buy'
+            '[%s -> %s] OK (size %s, in %.3f sec)',
+            quote_coin, base_coin, real_size, time.time() - start_trade_time
         )
-        if trade_unit.is_sell_phase:
-            base_coin = trade_unit.origin_coin
-            quote_coin = trade_unit.dest_coin
-        else:
-            base_coin = trade_unit.dest_coin
-            quote_coin = trade_unit.origin_coin
-
-        order_result = await self.hf_order(
-            base_coin=base_coin,
-            quote_coin=quote_coin,
-            price=str(trade_unit.price),
-            size=str(trade_unit.target_size),
-        )
-
-        if float(order_result['canceledSize']) > 0:
-            raise OrderCanceledError(
-                f'[{trade_unit.origin_coin} -> {trade_unit.dest_coin}] '
-                f'Order is canceled! Cycle Broken.'
-            )
-
-        fee = Decimal(order_result['fee'])
-        real_size = Decimal(order_result['dealSize'])
-        real_funds = Decimal(order_result['dealFunds'])
-
-        if trade_unit.is_sell_phase:
-            self.logger.info('Real Fee: %s', fee / real_funds)
-            pair_info = self.pairs_info[(base_coin, quote_coin)]
-
-            real_funds = real_funds - fee.quantize(pair_info.quote_increment)
-        else:
-            # fee is not work, idk :P
-            pass
-
-        self.logger.info('[%s -> %s] OK', quote_coin, base_coin)
-        return real_size, real_funds
+        return real_size
 
     async def create_order(
             self,
-            base_coin: BaseCoin | QuoteCoin,
-            quote_coin: QuoteCoin | BaseCoin,
+            base_coin: BaseCoin,
+            quote_coin: QuoteCoin,
             price: str,
-            size: str
+            size: str,
+            is_sell: bool,
+            time_in_force: Literal['GTC', 'GTT', 'IOC', 'FOK'] = 'FOK',
+            cancel_after: int = 0,
     ) -> str:
         endpoint = '/api/v1/orders'
 
-        if ticker := self.pairs_to_tickers.get((base_coin, quote_coin)):
-            trade_side = 'buy'
-        elif ticker := self.pairs_to_tickers.get((quote_coin, base_coin)):
-            trade_side = 'sell'
-        else:
-            raise Exception(f'Pair {base_coin} - {quote_coin} does not exist!')
-
-        data = await self.do_request(
-            'POST',
-            endpoint,
-            data={
-                'clientOid': str(self.next_uuid()),
-                'side': trade_side,
-                'symbol': ticker,
-                'price': price,
-                'size': size,
-                # optional
-                'type': 'limit',
-                'tradeType': 'TRADE',
-                'timeInForce': 'FOK',
-                # 'timeInForce': 'IOC',
-            },
-            private=True
+        data = await self._create_order_base(
+            endpoint=endpoint,
+            base_coin=base_coin,
+            quote_coin=quote_coin,
+            price=price,
+            size=size,
+            is_sell=is_sell,
+            time_in_force=time_in_force,
+            cancel_after=cancel_after,
         )
         return data['orderId']
 
-    async def hf_order(
+    async def create_hf_order(
             self,
-            base_coin: BaseCoin | QuoteCoin,
-            quote_coin: QuoteCoin | BaseCoin,
+            base_coin: BaseCoin,
+            quote_coin: QuoteCoin,
             price: str,
-            size: str
+            size: str,
+            is_sell: bool,
+            time_in_force: Literal['GTC', 'GTT', 'IOC', 'FOK'] = 'FOK',
+            cancel_after: int = 0,
     ) -> dict[str, str]:
         endpoint = '/api/v1/hf/orders/sync'
 
-        if ticker := self.pairs_to_tickers.get((base_coin, quote_coin)):
-            trade_side = 'buy'
-        elif ticker := self.pairs_to_tickers.get((quote_coin, base_coin)):
-            trade_side = 'sell'
-        else:
-            raise Exception(f'Pair {base_coin} - {quote_coin} does not exist!')
+        data = await self._create_order_base(
+            endpoint=endpoint,
+            base_coin=base_coin,
+            quote_coin=quote_coin,
+            price=price,
+            size=size,
+            is_sell=is_sell,
+            time_in_force=time_in_force,
+            cancel_after=cancel_after,
+        )
+        return data
+
+    async def _create_order_base(
+            self,
+            endpoint: str,
+            base_coin: BaseCoin,
+            quote_coin: QuoteCoin,
+            price: str,
+            size: str,
+            is_sell: bool,
+            time_in_force: Literal['GTC', 'GTT', 'IOC', 'FOK'] = 'FOK',
+            cancel_after: int = 0,
+    ):
+        trade_side = 'sell' if is_sell else 'buy'
+
+        try:
+            ticker = self.pairs_to_tickers[(base_coin, quote_coin)]
+        except KeyError:
+            print()
+            raise
+
+        request_data = {
+            'clientOid': str(self.next_uuid()),
+            'side': trade_side,
+            'symbol': ticker,
+            'price': price,
+            'size': size,
+            # optional
+            'type': 'limit',
+            'tradeType': 'TRADE',
+            'timeInForce': time_in_force,
+        }
+
+        if time_in_force == 'GTT':
+            # Good Till Time
+            request_data['cancelAfter'] = cancel_after  # sec
 
         data = await self.do_request(
             'POST',
             endpoint,
-            data={
-                'clientOid': str(self.next_uuid()),
-                'side': trade_side,
-                'symbol': ticker,
-                'price': price,
-                'size': size,
-                # optional
-                'type': 'limit',
-                'tradeType': 'TRADE',
-                'timeInForce': 'FOK',
-                # 'timeInForce': 'IOC',
-            },
+            data=request_data,
             private=True
         )
         return data
@@ -1038,7 +1300,7 @@ class Overman:
         # url = 'https://openapi-sandbox.kucoin.com' + endpoint
 
         if private:
-            timestamp = int(time.time() * 1000)  # convert to milliseconds
+            timestamp = int(time.time() * 1000) # + self.server_time_correction  # convert to milliseconds
             request_sign = self.signature(
                 timestamp, method,
                 endpoint + raw_params,
@@ -1098,17 +1360,26 @@ class Overman:
             'KC-API-PASSPHRASE': self.config.api_passphrase,
         }
 
-    async def get_order(self, order_id: str):
+    async def get_order(self, order_id: str, ticker: str = ''):
+        params = {}
+        if self.hf_trade:
+            endpoint = f'/api/v1/hf/orders/{order_id}'
+            params['symbol'] = ticker
+        else:
+            endpoint = f'/api/v1/orders/{order_id}'
         data = await self.do_request(
-            'GET', f'/api/v1/orders/{order_id}',
-            private=True
+            'GET',
+            endpoint,
+            params=params,
+            private=True,
         )
         return data
 
     async def update_balance(self):
         accounts_info = await self.get_accounts_list()
+        need_type = 'trade_hf' if self.hf_trade else 'trade'
         for acc_info in accounts_info:
-            if acc_info['type'] != 'trade':
+            if acc_info['type'] != need_type:
                 continue
 
             self.current_balance[acc_info['currency']] = Decimal(acc_info['available'])
@@ -1268,8 +1539,6 @@ class Overman:
             if 'TEST' in pair['baseCurrency'] or 'TEST' in pair['quoteCurrency']:
                 continue
 
-            if pair['quoteCurrency'] in base_to_quotes and pair['baseCurrency'] in quote_to_bases:
-                continue
             base_to_quotes[pair['baseCurrency']].add(pair['quoteCurrency'])
             quote_to_bases[pair['quoteCurrency']].add(pair['baseCurrency'])
 
@@ -1301,9 +1570,9 @@ class Overman:
 
         filtered_pairs = [
             (node.value, self.graph[edge.next_node_index].value)
-            for node in self.graph
+            for node in self.graph.nodes
             for edge in node.edges
-            if not edge.inversed
+            if not edge.inverted
         ]
         return filtered_pairs
 
@@ -1315,59 +1584,155 @@ class Overman:
                 if edge.val != 0:
                     counter += 1
             self.logger.info(
-                'Status: %s of %s edgers filled. Asyncio tasks: %s',
-                counter, index, len(asyncio.all_tasks())
+                'Status: %s of %s edgers filled. Asyncio tasks: %s. %s rps',
+                counter, index, len(asyncio.all_tasks()),
+                self.stat_counter / (time.time() - self.start_running)
             )
+            if self.stat_counter > 1000000:
+                self.stat_counter = 0
+                self.start_running = time.time()
             await self.update_balance()
+            await self.clear_orders_buffers()
             await asyncio.sleep(60)
 
-    def display_cycle_chart(self, predicted_units: list[TradeUnit], current_balance: Decimal):
-
-        # generate chart data
-        chart_data_unit = []
-        for tu in predicted_units:
+    def upkeep_cycle(self, predicted_units: list[TradeUnit], timeout: int = 10):
+        observes = []
+        for unit in predicted_units:
             ticker = (
-                self.pairs_to_tickers.get((tu.origin_coin, tu.dest_coin))
-                or self.pairs_to_tickers.get((tu.dest_coin, tu.origin_coin))
+                    self.pairs_to_tickers.get((unit.origin_coin, unit.dest_coin))
+                    or self.pairs_to_tickers.get((unit.dest_coin, unit.origin_coin))
             )
-            order_book = self.order_book_by_ticker[ticker]
-            for _ in order_book.:
-            chart_data_unit.append()
-        # save chart data to history
-        chart_history = self.chart_data.get()
-        if len(chart_history) >= 5:
-            chart_history.pop(0)
-        chart_history.append(chart_data_unit)
-        # draw chart data
-        # print chart data
-        plot_sizes = asciichartpy.plot(
-            [
-                min_sizes,
-                max_sizes,
-                target_sizes,
-            ],
-            {
-                'colors': [
-                    asciichartpy.green,
-                    asciichartpy.red,
-                    asciichartpy.white,
-                ],
-                'height': 20
-            }
+            curr_order_book = self.order_book_by_ticker[ticker]
+
+            observes.append(ObserveUnit(
+                trade_unit=unit,
+                order_book_history=[curr_order_book],
+            ))
+
+        observable = ObserveSequence(
+            observes=observes,
         )
-        plot_prices = asciichartpy.plot(
-            [
-                prices,
-                acc_prices,
-            ],
-            {
-                'colors': [
-                    asciichartpy.white,
-                    asciichartpy.yellow,
+        asyncio.create_task(self.observe(observable, timeout=timeout), name='observe')
+
+    async def observe(self, to_observe: ObserveSequence, timeout: int):
+        max_chart_width = 150
+        sleep_interval = timeout / max_chart_width
+
+        for _ in range(max_chart_width):
+            await asyncio.sleep(sleep_interval)
+            for obs_unit in to_observe.observes:
+                tu = obs_unit.trade_unit
+                ticker = (
+                    self.pairs_to_tickers.get((tu.origin_coin, tu.dest_coin))
+                    or self.pairs_to_tickers.get((tu.dest_coin, tu.origin_coin))
+                )
+                curr_order_book = self.order_book_by_ticker[ticker]
+
+                obs_unit.order_book_history.append(curr_order_book)
+
+        self.display_cycle_chart(to_observe)
+
+    def display_cycle_chart(self, to_observe: ObserveSequence):
+
+        # draw chart for every trade unit
+        for obs_unit in to_observe.observes:
+            trade_unit = obs_unit.trade_unit
+            bids_charts = list(zip(*(
+                (bid.price for bid in order_book.bids[:2])
+                for order_book in obs_unit.order_book_history
+            )))
+            asks_charts = list(zip(*(
+                (ask.price for ask in order_book.asks[:2])
+                for order_book in obs_unit.order_book_history
+            )))
+            price_line = [trade_unit.price] * len(obs_unit.order_book_history)
+            plot_order_book = asciichartpy.plot(
+                [
+                    price_line,
+                    *bids_charts,
+                    *asks_charts
                 ],
-                'height': 20
-            }
-        )
-        print(plot_sizes)
-        print(plot_prices)
-        print()
+                {
+                    'colors': [
+                        asciichartpy.yellow,
+                        *([asciichartpy.green] * len(bids_charts)),
+                        *([asciichartpy.red] * len(asks_charts)),
+                    ],
+                    'height': 20,
+                    'format': '{:5.8f}',
+                }
+            )
+
+            # render order book history info
+            order_book_history_info = ''
+            for order_book in obs_unit.order_book_history:
+                order_book_history_info = utils.join_multiline_strings(
+                    order_book_history_info,
+                    '  ',
+                    f'{order_book.asks[1].price} ({order_book.asks[1].count})\n'
+                    f'{order_book.asks[0].price} ({order_book.asks[0].count})\n'
+                    f'{order_book.bids[0].price} ({order_book.bids[0].count})\n'
+                    f'{order_book.bids[1].price} ({order_book.bids[1].count})',
+                    with_filling_space=True,
+                )
+
+            self.logger.info(
+                'Print chart for %s -> %s (price:%s)',
+                trade_unit.origin_coin,
+                trade_unit.dest_coin,
+                trade_unit.price
+            )
+            self.logger.info('\n' + order_book_history_info)
+            self.logger.info('\n' + plot_order_book)
+
+        #
+        #
+        # # generate chart data
+        # chart_data_unit = []
+        # for tu in predicted_units:
+        #     ticker = (
+        #         self.pairs_to_tickers.get((tu.origin_coin, tu.dest_coin))
+        #         or self.pairs_to_tickers.get((tu.dest_coin, tu.origin_coin))
+        #     )
+        #     order_book = self.order_book_by_ticker[ticker]
+        #     for _ in order_book.:
+        #     chart_data_unit.append()
+        # # save chart data to history
+        # chart_history = self.chart_data.get()
+        # if len(chart_history) >= 5:
+        #     chart_history.pop(0)
+        # chart_history.append(chart_data_unit)
+        # # draw chart data
+        # # print chart data
+        # plot_sizes = asciichartpy.plot(
+        #     [
+        #         min_sizes,
+        #         max_sizes,
+        #         target_sizes,
+        #     ],
+        #     {
+        #         'colors': [
+        #             asciichartpy.green,
+        #             asciichartpy.red,
+        #             asciichartpy.white,
+        #         ],
+        #         'height': 20
+        #     }
+        # )
+        # plot_prices = asciichartpy.plot(
+        #     [
+        #         prices,
+        #         acc_prices,
+        #     ],
+        #     {
+        #         'colors': [
+        #             asciichartpy.white,
+        #             asciichartpy.yellow,
+        #         ],
+        #         'height': 20
+        #     }
+        # )
+        # print(plot_sizes)
+        # print(plot_prices)
+        # print()
+

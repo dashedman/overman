@@ -7,6 +7,10 @@ from decimal import Decimal
 
 from tqdm import tqdm
 
+
+from graph_rs import EdgeRS
+
+
 INF = 1000000000
 
 
@@ -28,7 +32,7 @@ class Edge:
     next_node_index: int
     val: float = field(default=1.0)
     volume: float = field(default=1.0)
-    inversed: bool = field(default=False)
+    inverted: bool = field(default=False)
     original_price: Decimal = field(default=Decimal(1))
 
     def copy(self):
@@ -36,7 +40,7 @@ class Edge:
                     self.next_node_index,
                     self.val,
                     self.volume,
-                    self.inversed,
+                    self.inverted,
                     self.original_price)
 
 
@@ -155,9 +159,6 @@ class Graph:
     def __len__(self):
         return len(self.nodes)
 
-    def __iter__(self):
-        return iter(self.nodes)
-
     @property
     def edges(self) -> Iterable[Edge]:
         return itertools.chain.from_iterable(
@@ -189,7 +190,15 @@ class Graph:
 
         node_1 = self.get_node_for_coin(coin1)
         for edge in node_1.edges:
-            edge.next_node_index
+            node_2 = self.nodes[edge.next_node_index]
+            if node_2.value == coin2:
+                yield edge
+
+        node_2 = self.get_node_for_coin(coin2)
+        for edge in node_2.edges:
+            node_1 = self.nodes[edge.next_node_index]
+            if node_1.value == coin1:
+                yield edge
 
     def restore_cycle(
             self,
