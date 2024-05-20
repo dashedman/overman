@@ -7,7 +7,6 @@ import random
 import time
 import uuid
 from collections import defaultdict
-from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime
 from functools import cached_property
@@ -19,7 +18,7 @@ import aiohttp as aiohttp
 import asciichartpy
 import orjson as orjson
 import websockets
-from graph_rs import EdgeRS
+# from graph_rs import EdgeRS
 from tqdm import tqdm
 
 import bot.logger
@@ -122,6 +121,9 @@ class TradeUnit:
             target_size=self.target_size,
             funds_info=self.funds_info,
         )
+    
+    
+TradeUnitList = list[TradeUnit]
 
 
 @dataclass(kw_only=True)
@@ -159,7 +161,7 @@ class TradeCycleResult:
 
 @dataclass(kw_only=True)
 class TradeSegmentResult:
-    segment: list[TradeUnit]
+    segment: TradeUnitList
     start_balance: Decimal
     end_balance: Decimal
     trade_time: float = 0
@@ -322,13 +324,13 @@ class Overman:
             asyncio.create_task(self.status_monitor())
         )
 
-        self.result_logger.info('Start trading')
+        self.result_logger.info('Start trading bot')
         self.start_running = time.time()
         try:
             await asyncio.gather(*tasks)
         except asyncio.CancelledError:
             await self.session.close()
-        self.result_logger.info('End trading')
+        self.result_logger.info('Finish trading bot')
         # edit graph
         # trade if graph gave a signal
 
@@ -639,6 +641,8 @@ class Overman:
             if virtual_ask.count >= size and ask_volume >= min_funds:
                 virtual_ask.price = ask.price
                 break
+        else:
+            virtual_ask.price = order_book.asks[-1].price
 
         for bid in order_book.bids:
             bid_volume += bid.price * bid.count
@@ -646,6 +650,8 @@ class Overman:
             if virtual_bid.count >= size and bid_volume >= min_funds:
                 virtual_bid.price = bid.price
                 break
+        else:
+            virtual_bid.price = order_book.bids[-1].price
         return virtual_ask, virtual_bid
 
     def trigger_trade(self):
@@ -654,7 +660,7 @@ class Overman:
 
         self.is_on_trade = True
         start_time = time.time()
-        graph_copy = self.graph.copy()
+        graph_copy = self.graph.py_copy()
         asyncio.create_task(self.process_trade(graph_copy, time.time() - start_time))
 
     @staticmethod
@@ -757,6 +763,22 @@ class Overman:
                 fail_reason=f'Start balance greater than balance: {real_start} > {current_balance}'
             )
 
+        there_is_dead_price = self.validate_dead_prices(predicted_units)
+        if there_is_dead_price:
+            trade_unit, order_pair = there_is_dead_price
+            if trade_unit.is_sell_phase:
+                msg = f'{trade_unit.price} < {order_pair.price}'
+            else:
+                msg = f'{trade_unit.price} > {order_pair.price}'
+            return TradeCycleResult(
+                cycle=cycle,
+                profit_koef=profit_koef,
+                profit_time=profit_time,
+                started=False,
+                balance_difference=Decimal(0),
+                fail_reason=f'There is dead price: ' + msg
+            )
+
         for predict_unit in predicted_units:
             self.logger.info(
                 '%s %s %s min %s max %s target %s funds %s',
@@ -796,13 +818,16 @@ class Overman:
             self.logger.warning(list(f'({unit.origin_coin} -> {unit.dest_coin})' for unit in seg))
 
         results = await asyncio.gather(
-            *(self.trade_segment(seg, trade_timeout=trade_timeout) for seg in segments),
+            *(
+                self.trade_segment(seg, trade_timeout=trade_timeout)
+                for seg in reversed(segments)
+            ),
             return_exceptions=True
         )
 
         no_exceptions = True
         seg_results = []
-        for result in results:
+        for result in reversed(results):
             if isinstance(result, BaseException):
                 self.logger.error('Catch error from segment:', exc_info=result)
                 no_exceptions = False
@@ -838,7 +863,7 @@ class Overman:
             cycle: Cycle,
             prefer_start_funds: Decimal = Decimal(0),
     ) -> list[TradeUnit]:
-        default_fee = Decimal('0.001')
+        pair_fee = Decimal('0.001')
         default_rounding = ROUND_HALF_DOWN
         # default_rounding = ROUND_FLOOR
         predict_results = []
@@ -858,14 +883,8 @@ class Overman:
             else:
                 fixed_pair = (base_coin, quote_coin)
 
-            try:
-                pair_info = self.pairs_info[fixed_pair]
-            except KeyError:
-                try:
-                    pair_info = self.pairs_info[fixed_pair]
-                except KeyError as e:
-                    print()
-                    raise
+            pair_info = self.pairs_info[fixed_pair]
+            # pair_fee = self.pair_to_fee[fixed_pair]
             is_sell_phase = edge.inverted
 
             min_size = Decimal(pair_info.baseMinSize)
@@ -881,12 +900,12 @@ class Overman:
 
                 last_min_sell_size = max(
                     min_size,
-                    last_min_funds / (1 - default_fee) / edge.original_price,
+                    last_min_funds / (1 - pair_fee) / edge.original_price,
                     min_funds / edge.original_price
                 ).quantize(size_increment, rounding=default_rounding)
                 last_max_sell_size = min(
                     max_size,
-                    last_max_funds / (1 - default_fee) / edge.original_price,
+                    last_max_funds / (1 - pair_fee) / edge.original_price,
                     edge.volume
                 ).quantize(size_increment, rounding=default_rounding)
                 predict_results.append(TradeUnit(
@@ -947,6 +966,7 @@ class Overman:
             else:
                 fixed_pair = (base_coin, quote_coin)
             pair_info = self.pairs_info[fixed_pair]
+            # pair_fee = self.pair_to_fee[fixed_pair]
 
             size_increment = pair_info.base_increment
             quote_increment = pair_info.quote_increment
@@ -964,7 +984,7 @@ class Overman:
                     )
                 ).quantize(size_increment, rounding=default_rounding)
                 last_funds = (
-                    last_sell_size * trade_unit.price * (1 - default_fee)
+                    last_sell_size * trade_unit.price * (1 - pair_fee)
                 ).quantize(quote_increment, rounding=default_rounding)
                 trade_unit.target_size = last_sell_size
                 trade_unit.funds_info = last_funds
@@ -1000,10 +1020,42 @@ class Overman:
         ).quantize(pair_info.quote_increment, default_rounding)
 
         return predict_results
+    
+    def validate_dead_prices(self, trade_units: TradeUnitList):
+        there_is_dead_price = None
+        for trade_unit in trade_units:
+            pair = trade_unit.get_base_quote()
+            ticker = self.pairs_to_tickers[pair]
+            order_book = self.order_book_by_ticker[ticker]
+            ask, bid = self.tune_to_size_n_funds(
+                trade_unit.target_size,
+                trade_unit.funds_info,
+                order_book,
+            )
+
+            if trade_unit.is_sell_phase:
+                self.logger.debug(
+                    '[%s -> %s] Sell %s for %s. Curr BID: (c: %s, p: %s)',
+                    trade_unit.origin_coin, trade_unit.dest_coin,
+                    trade_unit.target_size, trade_unit.price,
+                    bid.count, bid.price,
+                )
+                if bid.price < trade_unit.price:
+                    there_is_dead_price = (trade_unit, bid)
+            else:
+                self.logger.debug(
+                    '[%s -> %s] Buy %s for %s. Curr ASK: (c: %s, p: %s)',
+                    trade_unit.origin_coin, trade_unit.dest_coin,
+                    trade_unit.target_size, trade_unit.price,
+                    ask.count, ask.price,
+                )
+                if ask.price > trade_unit.price:
+                    there_is_dead_price = (trade_unit, ask)
+        return there_is_dead_price
 
     async def trade_segment(
             self,
-            segment: list[TradeUnit],
+            segment: TradeUnitList,
             trade_timeout: int,
     ) -> TradeSegmentResult:
         # prepare
@@ -1076,7 +1128,6 @@ class Overman:
             'sell' if trade_unit.is_sell_phase else 'buy'
         )
         base_coin, quote_coin = trade_unit.get_base_quote()
-        ticker = self.pairs_to_tickers[(base_coin, quote_coin)]
 
         if self.hf_trade:
             order_result = await self.create_hf_order(
@@ -1118,23 +1169,28 @@ class Overman:
                     'cancelExist': True,
                 }
                 break
-            else:
-                await asyncio.sleep(0)
-                continue
-                order_result = await self.get_order(order_id, ticker=ticker)
-            # self.logger.info(f'{order_result}')
-            if order_result is None:
-                self.logger.warning('Catch None from get_order(%s, %s)!', order_id, ticker)
-                continue
 
-            order_is_active = order_result.get('active') or order_result.get('isActive')
+            self.display(
+                f'[{trade_unit.origin_coin} -> {trade_unit.dest_coin}] '
+                f'Order is active for now! Waiting timeout ({trade_timeout})...',
+                throttling=100
+            )
+            await asyncio.sleep(0)
+            continue
+            #     order_result = await self.get_order(order_id, ticker=ticker)
+            # # self.logger.info(f'{order_result}')
+            # if order_result is None:
+            #     self.logger.warning('Catch None from get_order(%s, %s)!', order_id, ticker)
+            #     continue
 
-            if order_is_active:
-                self.display(
-                    f'[{trade_unit.origin_coin} -> {trade_unit.dest_coin}] '
-                    f'Order is active for now! Waiting timeout ({trade_timeout})...',
-                    throttling=3
-                )
+            # order_is_active = order_result.get('active') or order_result.get('isActive')
+
+            # if order_is_active:
+            #     self.display(
+            #         f'[{trade_unit.origin_coin} -> {trade_unit.dest_coin}] '
+            #         f'Order is active for now! Waiting timeout ({trade_timeout})...',
+            #         throttling=3
+            #     )
 
         real_size = Decimal(order_result['dealSize'])
 
@@ -1595,7 +1651,7 @@ class Overman:
             await self.clear_orders_buffers()
             await asyncio.sleep(60)
 
-    def upkeep_cycle(self, predicted_units: list[TradeUnit], timeout: int = 10):
+    def upkeep_cycle(self, predicted_units: TradeUnitList, timeout: int = 10):
         observes = []
         for unit in predicted_units:
             ticker = (

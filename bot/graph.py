@@ -8,7 +8,7 @@ from decimal import Decimal
 from tqdm import tqdm
 
 
-from graph_rs import EdgeRS
+from graph_rs import GraphNodeRS, EdgeRS, CycleRS, GraphRS
 
 
 INF = 1000000000
@@ -31,11 +31,11 @@ class Edge:
     origin_node_index: int
     next_node_index: int
     val: float = field(default=1.0)
-    volume: float = field(default=1.0)
+    volume: Decimal = field(default=Decimal(1))
     inverted: bool = field(default=False)
     original_price: Decimal = field(default=Decimal(1))
 
-    def copy(self):
+    def py_copy(self):
         return Edge(self.origin_node_index,
                     self.next_node_index,
                     self.val,
@@ -54,10 +54,10 @@ class GraphNode:
     def __eq__(self, other: 'GraphNode'):
         return self.value == other.value
 
-    def copy(self):
+    def py_copy(self):
         return GraphNode(
             index=self.index,
-            edges=[edge.copy() for edge in self.edges],
+            edges=[edge.py_copy() for edge in self.edges],
             value=self.value,
         )
 
@@ -75,7 +75,7 @@ class Cycle:
     def __getitem__(self, item):
         return self.q[item]
 
-    def copy(self):
+    def py_copy(self):
         return Cycle(self.q.copy())
 
     def get_profit(self) -> float:
@@ -127,7 +127,7 @@ class Cycle:
 @dataclass
 class Graph:
     nodes: list[GraphNode]
-    __names_to_index: dict[str, int] = None
+    __names_to_index: dict[str, int] = field(default_factory=dict)
     __need_update: bool = True
 
     def __getitem__(self, item):
@@ -165,9 +165,9 @@ class Graph:
             node.edges for node in self.nodes
         )
 
-    def copy(self) -> 'Graph':
+    def py_copy(self) -> 'Graph':
         # average time 0.01 sec
-        return Graph(nodes=[node.copy() for node in self.nodes])
+        return Graph(nodes=[node.py_copy() for node in self.nodes])
 
     def delete_nodes(self, node_indexes_to_del: Iterable[int]):
         for index in sorted(node_indexes_to_del, reverse=True):
@@ -176,7 +176,7 @@ class Graph:
     def get_index_for_coin_name(self, coin: str):
         if self.__need_update:
             self.__names_to_index = {}
-            for index, node in enumerate(self):
+            for index, node in enumerate(self.nodes):
                 self.__names_to_index[node.value] = index
             self.__need_update = False
 
@@ -481,6 +481,12 @@ class Graph:
             index for index, status in enumerate(visited)
             if status == VisitStatus.InCycle
         ]
+
+
+Edge = EdgeRS
+GraphNode = GraphNodeRS
+Cycle = CycleRS
+Graph = GraphRS
 
 
 if __name__ == '__main__':

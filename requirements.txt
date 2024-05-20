@@ -7,3 +7,4 @@ orjson~=3.9.7
 aiohttp
 PyYAML~=6.0.1
 asciichartpy
+maturin

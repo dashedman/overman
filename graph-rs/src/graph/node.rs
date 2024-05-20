@@ -1,6 +1,8 @@
+use std::fmt;
+
 use pyo3::prelude::*;
+use pyo3::types::PyList;
 use pyo3::{pyclass, pymethods, PyResult};
-use crate::graph::edge::EdgeRS;
 
 
 #[pyclass]
@@ -9,7 +11,8 @@ pub struct GraphNodeRS {
     #[pyo3(get, set)]
     pub index: usize,
     #[pyo3(get, set)]
-    pub edges: Vec<EdgeRS>,
+    // Vec<Py<EdgeRS>>
+    pub edges: Py<PyList>,
     #[pyo3(get, set)]
     pub value: String,
 }
@@ -24,17 +27,32 @@ impl GraphNodeRS {
     ))]
     fn new(
         index: usize,
-        edges: Vec<EdgeRS>,
+        edges: Bound<'_, PyList>,
         value: String,
     ) -> Self {
+        let unbound_edge = edges.unbind();
         GraphNodeRS {
             index,
-            edges,
+            edges: unbound_edge,
             value,
         }
     }
 
+    fn __str__(&self) -> String {
+        format!(
+            "GraphNodeRS(index={}, edges={}, value={})",
+            self.index, self.edges, self.value,
+        )
+    }
+
     fn py_copy(&self) -> PyResult<Self> {
         Ok((*self).clone())
+    }
+}
+
+
+impl fmt::Display for GraphNodeRS {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.__str__())
     }
 }
