@@ -5,10 +5,8 @@ from dataclasses import dataclass, field
 from collections import deque
 from decimal import Decimal
 
+from graph_rs import GraphNodeRS
 from tqdm import tqdm
-
-
-from graph_rs import GraphNodeRS, EdgeRS, CycleRS, GraphRS
 
 
 INF = 1000000000
@@ -126,7 +124,7 @@ class Cycle:
 
 @dataclass
 class Graph:
-    nodes: list[GraphNode]
+    nodes: list[GraphNode | GraphNodeRS]
     __names_to_index: dict[str, int] = field(default_factory=dict)
     __need_update: bool = True
 
@@ -134,7 +132,7 @@ class Graph:
         return self.nodes[item]
 
     def __delitem__(self, key):
-        self.nodes.pop(key)
+        del self.nodes[key]
         for node in self.nodes:
             edges_to_del = []
             edges_to_decrease = []
@@ -150,7 +148,7 @@ class Graph:
             for index in edges_to_decrease:
                 node.edges[index].next_node_index -= 1
             for index in sorted(edges_to_del, reverse=True):
-                node.edges.pop(index)
+                del node.edges[index]
             for edge in node.edges:
                 edge.origin_node_index = node.index
 
@@ -161,9 +159,9 @@ class Graph:
 
     @property
     def edges(self) -> Iterable[Edge]:
-        return itertools.chain.from_iterable(
+        return list(itertools.chain.from_iterable(
             node.edges for node in self.nodes
-        )
+        ))
 
     def py_copy(self) -> 'Graph':
         # average time 0.01 sec
@@ -483,10 +481,10 @@ class Graph:
         ]
 
 
-Edge = EdgeRS
-GraphNode = GraphNodeRS
-Cycle = CycleRS
-Graph = GraphRS
+# Edge = EdgeRS
+# GraphNode = GraphNodeRS
+# Cycle = CycleRS
+# Graph = GraphRS
 
 
 if __name__ == '__main__':

@@ -1,5 +1,6 @@
 use std::fmt::{self, Display, Formatter};
 
+use pyo3::types::{PyIterator, PyList};
 use rust_decimal::prelude::*;
 use pyo3::prelude::*;
 use pyo3::{pyclass, pymethods, PyResult};
@@ -22,6 +23,49 @@ pub struct EdgeRS {
     #[pyo3(get)]
     pub original_price: Decimal,
 }
+
+
+#[pyclass(sequence)]
+#[derive(Debug)]
+pub struct Vec_EdgeRS {
+    pub vec: Vec<Py<EdgeRS>>,
+}
+
+
+#[pymethods]
+impl Vec_EdgeRS {
+    fn __len__<'py>(&self) -> PyResult<usize> {
+        Ok(self.vec.len())
+    }
+
+    fn __iter__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyIterator>> { 
+        PyIterator::from_bound_object( &PyList::new_bound(py, self.vec.clone()) )
+    }
+
+    fn __getitem__<'py>(&self, py: Python<'py>, index: usize) -> PyResult<&Bound<'py, EdgeRS>> {
+        Ok(self.vec[index].bind(py))
+    }
+
+    fn __delitem__<'py>(&mut self, index: usize) -> PyResult<()> {
+        self.vec.remove(index);
+        Ok(())
+    }
+}
+
+
+impl Vec_EdgeRS {
+    pub fn from_pylist(py: Python, edges_list: Bound<PyList>) -> PyResult<Py<Vec_EdgeRS>> {
+        let mut edges_vec = Vec::with_capacity(edges_list.len());
+
+        for edge_pa in edges_list.iter() {
+            let edge = edge_pa.downcast_into::<EdgeRS>()?;
+            edges_vec.push(edge.unbind());
+        }
+
+        Py::new(py, Vec_EdgeRS {vec: edges_vec})
+    }
+}
+
 
 #[pymethods]
 impl EdgeRS {

@@ -1,5 +1,8 @@
 from decimal import Decimal
 from dataclasses import dataclass, field
+from typing import Collection
+
+from sortedcontainers import SortedList, SortedDict
 
 
 @dataclass
@@ -18,9 +21,9 @@ class OrderBookPair:
 
 
 @dataclass
-class BestOrders:
-    asks: list['OrderBookPair'] = field(default_factory=list)     # sell orders
-    bids: list['OrderBookPair'] = field(default_factory=list)     # buy orders
+class AbstractOrders:
+    asks: Collection['OrderBookPair']     # sell orders
+    bids: Collection['OrderBookPair']     # buy orders
 
     @property
     def best_ask(self):
@@ -45,3 +48,21 @@ class BestOrders:
     def ensure_sorted(self):
         assert self.asks == sorted(self.asks)
         assert self.bids == sorted(self.bids, reverse=True)
+
+
+@dataclass
+class BestOrders(AbstractOrders):
+    asks: list[OrderBookPair] = field(default_factory=list)     # sell orders
+    bids: list[OrderBookPair] = field(default_factory=list)     # buy orders
+
+
+Price = Decimal
+Size = Decimal
+
+
+@dataclass
+class FullOrders(AbstractOrders):
+    asks: SortedDict[Price, Size] = field(default_factory=SortedDict)     # sell orders
+    bids: SortedDict[Price, Size] = field(default_factory=SortedDict)     # buy orders
+    last_sequence: int = field(default_factory=int)
+

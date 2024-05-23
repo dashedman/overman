@@ -9,5 +9,7 @@ name = "graph_rs"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = { version = "0.21.2", features = ["rust_decimal"] }
+pyo3 = { version = "^0.21", features = ["rust_decimal"] }
+pyo3-asyncio = { git="https://github.com/jopemachine/pyo3-asyncio.git", branch = "migration-pyo3-0.21", features = ["attributes", "tokio-runtime"] }
+tokio = "^1.37"
 rust_decimal = "1.35.0"

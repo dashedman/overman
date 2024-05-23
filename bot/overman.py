@@ -2,23 +2,25 @@ import asyncio
 import base64
 import hashlib
 import hmac
-import json
 import random
 import time
 import uuid
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime
 from functools import cached_property
 from itertools import chain
 from typing import Literal, Any, NewType
-from decimal import Decimal, ROUND_UP, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_DOWN
+from decimal import Decimal, ROUND_HALF_DOWN
 
 import aiohttp as aiohttp
 import asciichartpy
 import orjson as orjson
 import websockets
-# from graph_rs import EdgeRS
+
+from graph_rs import EdgeRS, GraphNodeRS, GraphRS
+from sortedcontainers import SortedDict
+
 from tqdm import tqdm
 
 import bot.logger
@@ -137,6 +139,7 @@ class TradeCycleResult:
     trade_time: float = 0
     overhauls: int = None
     fail_reason: str = None
+    need_to_log: bool = False
 
     def one_line_status(self) -> str:
         values_chain = ' -> '.join(
@@ -179,9 +182,10 @@ class ObserveSequence:
 
 
 class Overman:
-    graph: Graph
+    graph: Graph | GraphRS
     loop: asyncio.AbstractEventLoop
     stat_counter: int = 0
+    handle_sum: float = 0.0
     start_running: float = -1
     tickers_to_pairs: dict[str, tuple[str, str]]
     pairs_to_tickers: dict[tuple[str, str], str]
@@ -189,6 +193,7 @@ class Overman:
     pair_to_fee: dict[tuple[str, str], Decimal]
     done_orders: dict[str, Any]
     canceled_orders: dict[str, Any]
+    init_market_cache: dict[str, list[tuple[dict, int]]]
     hf_trade: bool
 
     def __init__(
@@ -203,7 +208,7 @@ class Overman:
         self.pivot_coins = pivot_coins
         self.hf_trade = hf_trade
 
-        self.order_book_by_ticker: dict[str, 'dto.BestOrders'] = {}
+        self.order_book_by_ticker: dict[str, dto.BestOrders | dto.FullOrders] = {}
         self.__token = None
         self.__private_token = None
         self._ping_interval = None
@@ -223,12 +228,13 @@ class Overman:
         self.current_balance: dict[str, Decimal] = {}
         self.done_orders = {}
         self.canceled_orders = {}
+        self.init_market_cache = defaultdict(list)
 
         self.status_bar = tqdm(colour='green')
 
     @cached_property
     def session(self):
-        return aiohttp.ClientSession()
+        return aiohttp.ClientSession(json_serialize=orjson.dumps)
 
     @cached_property
     def logger(self):
@@ -251,6 +257,15 @@ class Overman:
             "id": "test",
             "type": "subscribe",
             "topic": f"/spotMarket/level2Depth5:{','.join(subs_chunk)}",
+            "response": True
+        }
+
+    @staticmethod
+    def prepare_market_sub(subs_chunk: tuple[str]):
+        return {
+            "id": "test3",
+            "type": "subscribe",
+            "topic": f"/market/level2:{','.join(subs_chunk)}",
             "response": True
         }
 
@@ -311,12 +326,19 @@ class Overman:
 
         # starting to listen sockets
         # max 100 tickers per connection
-        ticker_chunks = utils.chunk(self.tickers_to_pairs.keys(), 50)
+        ticker_chunks = utils.chunk(self.tickers_to_pairs.keys(), 80)
 
-        tasks = [
-            asyncio.create_task(self.monitor_socket(ch))
-            for ch in ticker_chunks
-        ]
+        if True:
+            tasks = [
+                asyncio.create_task(self.market_monitor_socket(ch))
+                for ch in ticker_chunks
+            ]
+            tasks.append(asyncio.create_task(self.fetch_order_books(4)))
+        else:
+            tasks = [
+                asyncio.create_task(self.monitor_socket(ch))
+                for ch in ticker_chunks
+            ]
         tasks.append(
             asyncio.create_task(self.orders_socket())
         )
@@ -325,7 +347,7 @@ class Overman:
         )
 
         self.result_logger.info('Start trading bot')
-        self.start_running = time.time()
+        self.start_running = time.perf_counter()
         try:
             await asyncio.gather(*tasks)
         except asyncio.CancelledError:
@@ -400,13 +422,13 @@ class Overman:
                 last_ping = time.time()
                 if subs:
                     sub = self.prepare_sub(subs)
-                    pairs = json.dumps(sub)
+                    pairs = orjson.dumps(sub).decode()
                     await sock.send(pairs)
 
                 while True:
                     try:
                         orderbook_raw: str = await sock.recv()
-                        orderbook: dict = json.loads(orderbook_raw)
+                        orderbook: dict = orjson.loads(orderbook_raw)
                         if orderbook.get('code') == 401:
                             self.logger.info("Token has been expired")
                             await self.reload_token()
@@ -419,10 +441,56 @@ class Overman:
                                 pass
 
                         if last_ping + self._ping_interval * 0.8 < time.time():
-                            await sock.send(json.dumps({
+                            await sock.send(orjson.dumps({
                                 'id': str(self.next_ws_id()),
                                 'type': 'ping'
-                            }))
+                            }).decode())
+                            last_ping = time.time()
+                    except websockets.ConnectionClosed as e:
+                        self.logger.error('Catch error from websocket: %s', e, exc_info=e)
+                    except Exception as e:
+                        self.logger.error(
+                            'Catch error while monitoring socket:\n',
+                            exc_info=e)
+                        break
+            except websockets.ConnectionClosed as e:
+                self.logger.error('websocket error: %s', e)
+
+    async def market_monitor_socket(self, subs: tuple[str]):
+        url = f"wss://ws-api-spot.kucoin.com/?token={await self.token()}"
+        async for sock in websockets.connect(url, ping_interval=None):
+            try:
+                last_ping = time.time()
+                if subs:
+                    sub = self.prepare_market_sub(subs)
+                    pairs = orjson.dumps(sub).decode()
+                    await sock.send(pairs)
+
+                while True:
+                    try:
+                        try:
+                            async with asyncio.timeout(self._ping_interval * 0.2):
+                                changes_raw: str = await sock.recv()
+                        except TimeoutError:
+                            pass
+                        else:
+                            changes: dict = orjson.loads(changes_raw)
+                            if changes.get('code') == 401:
+                                self.logger.info("Token has been expired")
+                                await self.reload_token()
+                                self.logger.info("Token reloaded")
+                            else:
+                                if 'data' in changes:
+                                    self.handle_raw_changes_data(changes['data'])
+                                else:
+                                    # pprint(changes)
+                                    pass
+
+                        if last_ping + self._ping_interval * 0.6 < time.time():
+                            await sock.send(orjson.dumps({
+                                'id': str(self.next_ws_id()),
+                                'type': 'ping'
+                            }).decode())
                             last_ping = time.time()
                     except websockets.ConnectionClosed as e:
                         self.logger.error('Catch error from websocket: %s', e, exc_info=e)
@@ -441,7 +509,7 @@ class Overman:
                 last_ping = time.time()
 
                 subscribe_msg = self.prepare_orders_topic()
-                subscribe_msg_raw = json.dumps(subscribe_msg)
+                subscribe_msg_raw = orjson.dumps(subscribe_msg).decode()
                 await sock.send(subscribe_msg_raw)
 
                 while True:
@@ -452,7 +520,7 @@ class Overman:
                         except TimeoutError:
                             pass
                         else:
-                            order_result: dict = json.loads(order_result_raw)
+                            order_result: dict = orjson.loads(order_result_raw)
                             if order_result.get('code') == 401:
                                 self.logger.info("Token has been expired")
                                 await self.reload_private_token()
@@ -465,10 +533,10 @@ class Overman:
                                     pass
 
                         if last_ping + self._private_ping_interval * 0.8 < time.time():
-                            await sock.send(json.dumps({
+                            await sock.send(orjson.dumps({
                                 'id': str(self.next_ws_id()),
                                 'type': 'ping'
-                            }))
+                            }).decode())
                             last_ping = time.time()
                     except websockets.ConnectionClosed as e:
                         self.logger.error('Catch error from websocket: %s', e, exc_info=e)
@@ -547,13 +615,69 @@ class Overman:
             self.update_graph(pair, bid, fee=pair_fee, inverted=True)
             self.trigger_trade()
 
+    def handle_raw_changes_data(
+            self,
+            changes_data: dict[str, str | int | dict[str, list[list[str]]]]
+    ):
+        """
+        {
+            "changes": {
+              "asks": [
+                [
+                  "18906", //price
+                  "0.00331", //size
+                  "14103845" //sequence
+                ],
+                ["18907.3", "0.58751503", "14103844"]
+              ],
+              "bids": [["18891.9", "0.15688", "14103847"]]
+            },
+            "sequenceEnd": 14103847,
+            "sequenceStart": 14103844,
+            "symbol": "BTC-USDT",
+            "time": 1663747970273 //milliseconds
+        }
+         "Ask" (предложение о продаже) - это цена, по которой продавец готов
+         продать определенное количество акций или других ценных бумаг.
+
+         "Bid" (предложение о покупке) - это цена, по которой покупатель готов
+          купить определенное количество акций или других ценных бумаг.
+        """
+        self.stat_counter += 1
+        start_handle = time.perf_counter()
+
+        ticker = changes_data['symbol']
+        order_book = self.update_order_book_by_changes(
+            ticker,
+            changes_data['changes'],
+            changes_data['sequenceEnd']
+        )
+
+        self.logger.debug(
+            'symbol: %s, data: %s',
+            ticker, order_book
+        )
+        if order_book and order_book.is_relevant:
+            pair = self.tickers_to_pairs[ticker]
+            pair_info = self.pairs_info[pair]
+            pair_fee = self.pair_to_fee[pair]
+            min_funds = Decimal(pair_info.minFunds)
+            min_size = Decimal(pair_info.baseMinSize)
+
+            ask, bid = self.tune_to_size_n_funds_full(min_size, min_funds, order_book)
+            self.update_graph(pair, ask, fee=pair_fee)
+            self.update_graph(pair, bid, fee=pair_fee, inverted=True)
+            self.trigger_trade()
+
+        self.handle_sum += time.perf_counter() - start_handle
+
     def handle_order_event(
             self,
             raw_order_result: dict[str, str | dict[str, int | float | str]]
     ):
+        self.stat_counter += 1
+
         order_data = raw_order_result['data']
-        if isinstance(order_data, str):
-            print()
 
         match order_data['type'], order_data['status']:
             case 'filled', 'done':
@@ -587,6 +711,109 @@ class Overman:
             asks=prepared_ask_data,
             bids=prepared_bids_data
         )
+
+    def update_order_book_by_changes(
+            self,
+            ticker: str,
+            changes: dict[str, list[list[str]]],
+            new_sequence_end: int,
+    ) -> dto.FullOrders | None:
+        order_book: dto.FullOrders | None = self.order_book_by_ticker.get(ticker)
+
+        if order_book:
+            self.apply_market_changes(order_book, changes, new_sequence_end)
+            return order_book
+        else:
+            # cache data
+            self.init_market_cache[ticker].append((changes, new_sequence_end))
+            return None
+
+    async def fetch_order_books(self, pause: int):
+        for _ in range(pause):
+            await asyncio.sleep(1)
+            self.logger.info(
+                'Wait for catching init_market_cache, %d, %d',
+                len(self.init_market_cache), len(self.tickers_to_pairs)
+            )
+            if len(self.init_market_cache) >= len(self.tickers_to_pairs):
+                break
+
+        self.logger.info('Get full orders books for %d pairs', len(self.tickers_to_pairs))
+        ticker_chunks = utils.chunk(self.tickers_to_pairs.keys(), 50)
+        for tc in tqdm(ticker_chunks, postfix='Full Order books loaded', ascii=True):
+            await asyncio.gather(*(self.get_full_order_book(ticker) for ticker in tc))
+
+    async def get_full_order_book(self, symbol: str):
+        data = await self.do_request(
+            'GET', '/api/v3/market/orderbook/level2',
+            params={'symbol': symbol},
+            private=True
+        )
+
+        curr_sequence = int(data['sequence'])
+        asks = SortedDict()
+        for price_str, size_str in data['asks']:
+            asks[Decimal(price_str)] = Decimal(size_str)
+
+        bids = SortedDict()
+        for price_str, size_str in data['bids']:
+            bids[Decimal(price_str)] = Decimal(size_str)
+
+        new_order_book = self.order_book_by_ticker[symbol] = dto.FullOrders(
+            asks=asks, bids=bids, last_sequence=curr_sequence,
+        )
+        # self.logger.info('Apply cached market (%d) to %s', len(self.init_market_cache[symbol]), symbol)
+        for changes, new_sequence_end in self.init_market_cache[symbol]:
+            self.apply_market_changes(new_order_book, changes, new_sequence_end)
+        del self.init_market_cache[symbol]
+
+    @staticmethod
+    def apply_market_changes(
+            order_book: dto.FullOrders,
+            changes: dict[str, list[list[str]]],
+            new_sequence_end: int
+    ):
+        sequence_end = order_book.last_sequence
+
+        for price_str, size_str, sequence_str in changes['asks']:
+            sequence = int(sequence_str)
+            if sequence <= sequence_end:
+                continue
+
+            price = Decimal(price_str)
+            if price == 0:
+                continue
+
+            size = Decimal(size_str)
+            if size == 0:
+                try:
+                    del order_book.asks[price]
+                except KeyError:
+                    pass
+                continue
+
+            order_book.asks[price] = size
+
+        for price_str, size_str, sequence_str in changes['bids']:
+            sequence = int(sequence_str)
+            if sequence <= sequence_end:
+                continue
+
+            price = Decimal(price_str)
+            if price == 0:
+                continue
+
+            size = Decimal(size_str)
+            if size == 0:
+                try:
+                    del order_book.bids[price]
+                except KeyError:
+                    pass
+                continue
+
+            order_book.bids[price] = size
+
+        order_book.last_sequence = max(new_sequence_end, sequence_end)
 
     @staticmethod
     def tune_to_funds(min_funds: Decimal, order_book: dto.BestOrders):
@@ -654,14 +881,46 @@ class Overman:
             virtual_bid.price = order_book.bids[-1].price
         return virtual_ask, virtual_bid
 
+    @staticmethod
+    def tune_to_size_n_funds_full(
+            size: Decimal,
+            min_funds: Decimal,
+            order_book: dto.FullOrders,
+    ):
+        ask_volume = 0
+        bid_volume = 0
+        virtual_ask = dto.OrderBookPair()
+        virtual_bid = dto.OrderBookPair()
+
+        for ask_price in order_book.asks:
+            ask_count = order_book.asks[ask_price]
+            ask_volume += ask_price * ask_count
+            virtual_ask.count += ask_count
+            if virtual_ask.count >= size and ask_volume >= min_funds:
+                virtual_ask.price = ask_price
+                break
+        else:
+            virtual_ask.price = order_book.asks.peekitem(-1)    # get max price, as worst
+
+        for bid_price in reversed(order_book.bids):
+            bid_count = order_book.bids[bid_price]
+            bid_volume += bid_price * bid_count
+            virtual_bid.count += bid_count
+            if virtual_bid.count >= size and bid_volume >= min_funds:
+                virtual_bid.price = bid_price
+                break
+        else:
+            virtual_bid.price = order_book.bids.peekitem(0)     # get min price, as worst
+        return virtual_ask, virtual_bid
+
     def trigger_trade(self):
         if self.is_on_trade:
             return
 
         self.is_on_trade = True
-        start_time = time.time()
+        start_time = time.perf_counter()
         graph_copy = self.graph.py_copy()
-        asyncio.create_task(self.process_trade(graph_copy, time.time() - start_time))
+        asyncio.create_task(self.process_trade(graph_copy, time.perf_counter() - start_time))
 
     @staticmethod
     def get_time_line():
@@ -671,17 +930,23 @@ class Overman:
         if throttling == random.randint(1, throttling):
             self.status_bar.display(f'[{self.get_time_line()}|status] {info}')
 
-    async def process_trade(self, graph: Graph, copy_time: float):
+    def display_f(self, f, throttling: int = 1):
+        if throttling == random.randint(1, throttling):
+            self.status_bar.display(f'[{self.get_time_line()}|status] {f()}')
+
+    async def process_trade(self, graph: GraphRS, copy_time: float):
         try:
-            start_calc = time.time()
-            experimental_profit = await self.loop.run_in_executor(
-                None,
-                self.check_profit_experimental_3,
-                graph
-            )
-            end_calc = time.time()
+            start_calc = time.perf_counter()
+            # experimental_profit = await self.loop.run_in_executor(
+            #     None,
+            #     self.check_profit_experimental_3,
+            #     graph
+            # )
+            # experimental_profit = self.check_profit_experimental_3(graph)
+            experimental_profit = graph.check_profit_experimental_3(self.pivot_indexes)
+            end_calc = time.perf_counter()
             if experimental_profit:
-                profit_koef, cycle = experimental_profit
+                profit_koef, cycle, cpu_profit_time = experimental_profit
                 profit_time = end_calc - start_calc
 
                 # TIME PRINT
@@ -700,15 +965,21 @@ class Overman:
                 if profit_koef >= 1:
                     self.display(
                         f'Current profit {profit_koef:.4f}, '
-                        f'ct: {profit_time:.5f}, copy time: {copy_time:.5f}',
-                        throttling=10,
+                        f'ct: {profit_time:.6f}, cct {cpu_profit_time:.6f}, copy time: {copy_time:.6f}',
+                        throttling=50,
                     )
                 else:
+                    self.display(
+                        f'I want to trade! Current profit {profit_koef:.4f}, '
+                        f'ct: {profit_time:.5f}, cct {cpu_profit_time:.5f}, copy time: {copy_time:.5f}',
+                        throttling=10,
+                    )
+                    return
                     res = await self.trade_cycle(cycle, profit_koef, profit_time)
-                    if res.balance_difference == 0:
-                        self.display(res.one_line_status(), throttling=2)
-                    else:
+                    if res.need_to_log:
                         self.result_logger.info(res.one_line_status())
+                    else:
+                        self.display_f(res.one_line_status, throttling=10)
 
                     if res.started:
                         self.was_traded = True
@@ -717,7 +988,7 @@ class Overman:
             self.is_on_trade = False
 
     async def trade_cycle(self, cycle: Cycle, profit_koef: float, profit_time: float) -> TradeCycleResult:
-        start_time = time.time()
+        start_time = time.perf_counter()
         trade_timeout = 10 * 60  # sec
 
         first_quote_coin = cycle.q[0][0].value
@@ -749,7 +1020,8 @@ class Overman:
                 profit_time=profit_time,
                 started=False,
                 balance_difference=Decimal(0),
-                fail_reason=f'Start min greater than start max: {start_unit.min_size} > {start_unit.max_size}'
+                fail_reason=f'Start min greater than start max: {start_unit.min_size} > {start_unit.max_size}',
+                need_to_log=False,
             )
 
         real_start = start_unit.funds_info
@@ -760,7 +1032,8 @@ class Overman:
                 profit_time=profit_time,
                 started=False,
                 balance_difference=Decimal(0),
-                fail_reason=f'Start balance greater than balance: {real_start} > {current_balance}'
+                fail_reason=f'Start balance greater than balance: {real_start} > {current_balance}',
+                need_to_log=False,
             )
 
         there_is_dead_price = self.validate_dead_prices(predicted_units)
@@ -776,7 +1049,8 @@ class Overman:
                 profit_time=profit_time,
                 started=False,
                 balance_difference=Decimal(0),
-                fail_reason=f'There is dead price: ' + msg
+                fail_reason=f'There is dead price: ' + msg,
+                need_to_log=False,
             )
 
         for predict_unit in predicted_units:
@@ -844,8 +1118,9 @@ class Overman:
                 profit_time=profit_time,
                 started=True,
                 real_profit=float(start_balance / end_balance),
-                trade_time=time.time() - start_time,
-                balance_difference=end_balance - start_balance
+                trade_time=time.perf_counter() - start_time,
+                balance_difference=end_balance - start_balance,
+                need_to_log=True,
             )
         else:
             return TradeCycleResult(
@@ -854,8 +1129,9 @@ class Overman:
                 profit_time=profit_time,
                 started=True,
                 balance_difference=Decimal(-1),
-                trade_time=time.time() - start_time,
-                fail_reason='Segments fault.'
+                trade_time=time.perf_counter() - start_time,
+                fail_reason='Segments fault.',
+                need_to_log=True,
             )
 
     def predict_cycle_parameters(
@@ -1027,11 +1303,18 @@ class Overman:
             pair = trade_unit.get_base_quote()
             ticker = self.pairs_to_tickers[pair]
             order_book = self.order_book_by_ticker[ticker]
-            ask, bid = self.tune_to_size_n_funds(
-                trade_unit.target_size,
-                trade_unit.funds_info,
-                order_book,
-            )
+            if isinstance(order_book, dto.FullOrders):
+                ask, bid = self.tune_to_size_n_funds_full(
+                    trade_unit.target_size,
+                    trade_unit.funds_info,
+                    order_book,
+                )
+            else:
+                ask, bid = self.tune_to_size_n_funds(
+                    trade_unit.target_size,
+                    trade_unit.funds_info,
+                    order_book,
+                )
 
             if trade_unit.is_sell_phase:
                 self.logger.debug(
@@ -1061,7 +1344,7 @@ class Overman:
         # prepare
         trade_unit = segment[0]
         start_balance = trade_unit.min_size if trade_unit.is_sell_phase else trade_unit.funds_info
-        start_time = time.time()
+        start_time = time.perf_counter()
         segment_str = ' -> '.join(
             chain((unit.origin_coin for unit in segment), (segment[-1].dest_coin,))
         )
@@ -1111,7 +1394,7 @@ class Overman:
             segment=segment,
             start_balance=start_balance,
             end_balance=real_size * trade_unit.price,
-            trade_time=time.time() - start_time
+            trade_time=time.perf_counter() - start_time
         )
 
     async def trade_pair(
@@ -1119,7 +1402,7 @@ class Overman:
             trade_unit: TradeUnit,
             trade_timeout: int = 0,
     ) -> Decimal:
-        start_trade_time = time.time()
+        start_trade_time = time.perf_counter()
         self.logger.info(
             f'[%s -> %s] Start{" HF" if self.hf_trade else ""}. (price: %s; size: %s, funds: %s, %s)',
             trade_unit.origin_coin, trade_unit.dest_coin,
@@ -1203,7 +1486,7 @@ class Overman:
 
         self.logger.info(
             '[%s -> %s] OK (size %s, in %.3f sec)',
-            quote_coin, base_coin, real_size, time.time() - start_trade_time
+            quote_coin, base_coin, real_size, time.perf_counter() - start_trade_time
         )
         return real_size
 
@@ -1378,7 +1661,7 @@ class Overman:
                 self.logger.error('Catch %s HTTP code while %s: %s',
                                   resp.status, url, await resp.read())
                 raise Exception('bad request')
-            data_json = await resp.json()
+            data_json = await resp.json(loads=orjson.loads)
             resp_code = int(data_json['code'])
 
             if resp_code == 200000:
@@ -1449,8 +1732,14 @@ class Overman:
         )
 
     async def get_accounts_list(self) -> list[dict[str, str]]:
-        data = await self.do_request('GET', '/api/v1/accounts', private=True)
-        return data
+        for _ in range(5):
+            try:
+                data = await self.do_request('GET', '/api/v1/accounts', private=True)
+            except Exception as e:
+                self.logger.error('Catch "%s" while updating balance. Trying again..', e)
+                continue
+            return data
+        raise Exception('Cannot get accounts list')
 
     async def get_actual_orderbook(self, ticker: str):
         data = await self.do_request(
@@ -1569,12 +1858,15 @@ class Overman:
         return None
 
     def check_profit_experimental_3(
-            self, graph: Graph,
-    ) -> tuple[float, Cycle] | None:
+            self, graph: Graph
+    ) -> tuple[float, Cycle, float] | None:
+
+        start_calc = time.perf_counter()
         best_profit = 10000000
         best_cycle = None
         for pivot_coin_index in self.pivot_indexes:
             profit, cycle = graph.get_profit_3(pivot_coin_index)
+            # profit, cycle = await graph.get_profit_3(pivot_coin_index)
             if cycle and not cycle.validate_cycle():
                 continue
             if profit != -1 and profit < best_profit:
@@ -1582,7 +1874,7 @@ class Overman:
                 best_cycle = cycle
 
         if best_cycle is not None:
-            return best_profit, best_cycle
+            return best_profit, best_cycle, time.perf_counter() - start_calc
         return None
 
     async def load_graph(self, instr_info) -> list[tuple[str, str]]:
@@ -1605,18 +1897,22 @@ class Overman:
             edges = []
             for tail in quote_to_bases[node_key]:
                 try:
-                    edges.append(Edge(index, node_keys.index(tail), 0, 0.0, False))
+                    # edges.append(Edge(index, node_keys.index(tail), 0, Decimal(0.0), False))
+                    edges.append(EdgeRS(index, node_keys.index(tail), 0, 0.0, False))
                 except ValueError:
                     continue
             for tail in base_to_quotes[node_key]:
                 try:
-                    edges.append(Edge(index, node_keys.index(tail), 0, 0.0, True))
+                    # edges.append(Edge(index, node_keys.index(tail), 0, Decimal(0.0), True))
+                    edges.append(EdgeRS(index, node_keys.index(tail), 0, 0.0, True))
                 except ValueError:
                     continue
 
-            node_list.append(GraphNode(index, edges=edges, value=node_key))
+            # node_list.append(GraphNode(index, edges=edges, value=node_key))
+            node_list.append(GraphNodeRS(index, edges=edges, value=node_key))
 
-        self.graph = Graph(node_list)
+        # self.graph = Graph(node_list)
+        self.graph = GraphRS(node_list)
 
         # filter to leave only cycles with base coins
         pivot_nodes = [
@@ -1634,19 +1930,16 @@ class Overman:
 
     async def status_monitor(self):
         while True:
-            counter = 0
-            index = 0
-            for index, edge in enumerate(self.graph.edges, start=1):
-                if edge.val != 0:
-                    counter += 1
             self.logger.info(
-                'Status: %s of %s edgers filled. Asyncio tasks: %s. %s rps',
-                counter, index, len(asyncio.all_tasks()),
-                self.stat_counter / (time.time() - self.start_running)
+                'Asyncio tasks: %d. %.3f rps. %.6f spr',
+                len(asyncio.all_tasks()),
+                self.stat_counter / (time.perf_counter() - self.start_running),
+                self.handle_sum / self.stat_counter if self.stat_counter > 0 else 0
             )
-            if self.stat_counter > 1000000:
+            if self.stat_counter > 50000:
                 self.stat_counter = 0
-                self.start_running = time.time()
+                self.handle_sum = 0
+                self.start_running = time.perf_counter()
             await self.update_balance()
             await self.clear_orders_buffers()
             await asyncio.sleep(60)
