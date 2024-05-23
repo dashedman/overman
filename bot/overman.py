@@ -1089,7 +1089,7 @@ class Overman:
                 need_to_log=False,
             )
 
-        there_is_dead_price = self.validate_dead_prices(predicted_units)
+        there_is_dead_price = await self.validate_dead_prices(predicted_units)
         if there_is_dead_price:
             trade_unit, order_pair = there_is_dead_price
             if trade_unit.is_sell_phase:
@@ -1118,7 +1118,7 @@ class Overman:
                 predict_unit.funds_info,
             )
 
-        self.upkeep_cycle(predicted_units, timeout=trade_timeout)
+        # self.upkeep_cycle(predicted_units, timeout=trade_timeout)
         # PREDICT END
         # START SEGMENTATION
         curr_segment = None
@@ -1350,8 +1350,9 @@ class Overman:
 
         return predict_results
     
-    def validate_dead_prices(self, trade_units: TradeUnitList):
+    async def validate_dead_prices(self, trade_units: TradeUnitList):
         there_is_dead_price = None
+        await asyncio.sleep(0.5)
         for trade_unit in trade_units:
             pair = trade_unit.get_base_quote()
             ticker = self.pairs_to_tickers[pair]
@@ -1846,7 +1847,7 @@ class Overman:
         quote_node = self.graph.get_node_for_coin(quote_coin)
         base_node_index = self.graph.get_index_for_coin_name(base_coin)
         for edge in quote_node.edges:
-            if edge.next_node_index == base_node_index:
+            if edge.next_node_index == base_node_index and edge.inverted == inverted:
 
                 edge.volume = new_value.count
                 edge.original_price = new_value.price
