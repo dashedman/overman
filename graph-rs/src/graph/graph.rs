@@ -4,7 +4,7 @@ use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use crate::graph::{EdgeRS, GraphNodeRS};
 
-use super::{CycleRS, Vec_NodeRS};
+use super::{py_to_decimal, CycleRS, Vec_NodeRS};
 
 
 #[repr(u8)]
@@ -169,8 +169,8 @@ impl GraphRS {
             let mut edge = edge_py.bind(py).borrow_mut();
 
             if edge.next_node_index == base_node_index && edge.inverted == inverted {
-                let new_value_price = new_value.getattr("price")?.extract::<Decimal>()?;
-                edge.volume = new_value.getattr("count")?.extract::<Decimal>()?;
+                let new_value_price = py_to_decimal(&new_value.getattr("price")?)?;
+                edge.volume = py_to_decimal(&new_value.getattr("count")?)?;
                 edge.original_price = new_value_price;
 
                 let decimal_one = Decimal::new(1, 0);

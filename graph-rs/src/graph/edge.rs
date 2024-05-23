@@ -5,7 +5,8 @@ use pyo3::types::{PyIterator, PyList};
 use rust_decimal::prelude::*;
 use pyo3::prelude::*;
 use pyo3::{pyclass, pymethods, PyResult};
-use pyo3::exceptions::PyValueError;
+
+use super::py_to_decimal;
 
 
 #[pyclass]
@@ -116,17 +117,7 @@ impl EdgeRS {
 
     #[setter]
     fn original_price(&mut self, obj: &Bound<'_, PyAny>) -> PyResult<()> {
-        let new_decimal;
-        if let Ok(val) = obj.extract() {
-            new_decimal = Decimal::new(val, 0);
-        } else {
-            let rs_str = obj.to_string();
-            new_decimal = Decimal::from_str(&rs_str).or_else(|_| {
-                Decimal::from_scientific(&rs_str).map_err(|e| PyValueError::new_err(e.to_string()))
-            })?
-        }
-
-        self.original_price = new_decimal;
+        self.original_price = py_to_decimal(obj)?;
         Ok(())
     }
 
