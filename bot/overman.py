@@ -782,6 +782,7 @@ class Overman:
         ticker_chunks = utils.chunk(self.tickers_to_pairs.keys(), 50)
         for tc in tqdm(ticker_chunks, postfix='Full Order books loaded', ascii=True):
             await asyncio.gather(*(self.get_full_order_book(ticker) for ticker in tc))
+        self.logger.info('Got full orders books for %d pairs', len(self.tickers_to_pairs))
 
     async def deffer_fetch_order_books(self, tickers: list[str]):
         for ticker in tickers:
@@ -789,6 +790,8 @@ class Overman:
                 del self.init_market_cache[ticker]
             if ticker in self.order_book_by_ticker:
                 del self.order_book_by_ticker[ticker]
+
+        await asyncio.sleep(3)
 
         self.logger.info('Restore full orders books for %s pairs', tickers)
         await asyncio.gather(*(self.get_full_order_book(ticker) for ticker in tickers))
@@ -1019,12 +1022,12 @@ class Overman:
                         throttling=50,
                     )
                 else:
-                    self.display(
-                        f'I want to trade! Current profit {profit_koef:.4f}, '
-                        f'ct: {profit_time:.5f}, cct {cpu_profit_time:.5f}, copy time: {copy_time:.5f}',
-                        throttling=10,
-                    )
-                    return
+                    # self.display(
+                    #     f'I want to trade! Current profit {profit_koef:.4f}, '
+                    #     f'ct: {profit_time:.5f}, cct {cpu_profit_time:.5f}, copy time: {copy_time:.5f}',
+                    #     throttling=10,
+                    # )
+                    # return
                     res = await self.trade_cycle(cycle, profit_koef, profit_time)
                     if res.need_to_log:
                         self.result_logger.info(res.one_line_status())
