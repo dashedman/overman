@@ -1,4 +1,5 @@
 use std::fmt::{self, Display, Formatter};
+use std::slice::Iter;
 
 use pyo3::types::{PyIterator, PyList};
 use rust_decimal::prelude::*;
@@ -63,6 +64,10 @@ impl Vec_EdgeRS {
         }
 
         Py::new(py, Vec_EdgeRS {vec: edges_vec})
+    }
+
+    pub fn iter(&self) -> Iter<Py<EdgeRS>> {
+        self.vec.iter()
     }
 }
 

@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use pyo3::{pyclass, pymethods, types::{PyAnyMethods, PyList, PyListMethods, PyString}, Bound, Py, PyRef, PyResult, Python};
+use pyo3::{pyclass, pymethods, types::{PyAnyMethods, PyList, PyListMethods, PyString}, Bound, Py, PyAny, PyRef, PyResult, Python};
+use rust_decimal::Decimal;
+use rust_decimal::prelude::ToPrimitive;
 use crate::graph::{EdgeRS, GraphNodeRS};
 
 use super::{CycleRS, Vec_NodeRS};
@@ -135,6 +137,58 @@ impl GraphRS {
         Ok(())
     }
 
+    #[pyo3(signature = (
+        coins_pair,
+        new_value,
+        *,
+        fee,
+        inverted=false,
+    ))]
+    fn update_graph_edge(
+        &mut self,
+        py: Python,
+        coins_pair: (Bound<PyString>, Bound<PyString>),
+        new_value: Bound<PyAny>, // 'dto.OrderBookPair'
+        fee: Decimal,
+        inverted: bool,
+    ) -> PyResult<()> {
+        // update pairs
+        let base_coin;
+        let quote_coin;
+        if inverted {
+            (base_coin, quote_coin) = (coins_pair.1, coins_pair.0);
+        } else {
+            (base_coin, quote_coin) = coins_pair;
+        }
+
+        let quote_node = self.get_node_for_coin(py, quote_coin)?.borrow();
+        let base_node_index = self.get_index_for_coin_name(py, base_coin)?;
+
+        let borrowed_edges = quote_node.edges.bind(py).borrow();
+        for edge_py in borrowed_edges.iter() {
+            let mut edge = edge_py.bind(py).borrow_mut();
+
+            if edge.next_node_index == base_node_index && edge.inverted == inverted {
+                let new_value_price = new_value.getattr("price")?.extract::<Decimal>()?;
+                edge.volume = new_value.getattr("count")?.extract::<Decimal>()?;
+                edge.original_price = new_value_price;
+
+                let decimal_one = Decimal::new(1, 0);
+                if inverted {
+                    // base per quote
+                    edge.val = 1.0 / (new_value_price * (decimal_one - fee)).to_f64().unwrap();
+                } else {
+                    // quote per base
+                    edge.val = (new_value_price / (decimal_one - fee)).to_f64().unwrap();
+                }
+                    
+                break
+            }
+        }
+
+        Ok(())
+    }
+    
     fn get_index_for_coin_name<'py>(
         &mut self, 
         py: Python<'py>, 

@@ -705,8 +705,8 @@ class Overman:
             min_size = Decimal(pair_info.baseMinSize)
 
             ask, bid = self.tune_to_size_n_funds_full(min_size, min_funds, order_book)
-            self.update_graph(pair, ask, fee=pair_fee)
-            self.update_graph(pair, bid, fee=pair_fee, inverted=True)
+            self.graph.update_graph_edge(pair, ask, fee=pair_fee)
+            self.graph.update_graph_edge(pair, bid, fee=pair_fee, inverted=True)
             self.trigger_trade()
 
         self.handle_sum += time.perf_counter() - start_handle
@@ -1836,7 +1836,8 @@ class Overman:
             self,
             coins_pair: tuple[BaseCoin, QuoteCoin],
             new_value: 'dto.OrderBookPair',
-            fee: Decimal = Decimal('0.001'),
+            *,
+            fee: Decimal,
             inverted: bool = False,
     ):
         # update pairs
