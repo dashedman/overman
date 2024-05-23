@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from functools import cached_property
 from itertools import chain
-from typing import Literal, Any, NewType
+from typing import Literal, Any, NewType, Callable
 from decimal import Decimal, ROUND_HALF_DOWN
 
 import aiohttp as aiohttp
@@ -236,7 +236,9 @@ class Overman:
         self.canceled_orders = {}
         self.init_market_cache = defaultdict(list)
 
-        self.status_bar = tqdm(colour='green')
+        self.status_bar = tqdm()
+        self.display_body: tuple[str, tuple] | Callable[[], str] = ('', ())
+        self.max_display = 0
 
     @cached_property
     def session(self):
@@ -359,6 +361,9 @@ class Overman:
         )
         tasks.append(
             asyncio.create_task(self.status_monitor())
+        )
+        tasks.append(
+            asyncio.create_task(self.display_engine())
         )
 
         self.result_logger.info('Start trading bot')
@@ -979,13 +984,23 @@ class Overman:
     def get_time_line():
         return datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
 
-    def display(self, info, throttling: int = 1):
-        if throttling == random.randint(1, throttling):
-            self.status_bar.display(f'[{self.get_time_line()}|status] {info}')
+    def display(self, info: str, *args):
+        self.display_body = (info, args)
 
-    def display_f(self, f, throttling: int = 1):
-        if throttling == random.randint(1, throttling):
-            self.status_bar.display(f'[{self.get_time_line()}|status] {f()}')
+    def display_f(self, f: Callable):
+        self.display_body = f
+
+    async def display_engine(self):
+        while True:
+            await asyncio.sleep(1)
+            if isinstance(self.display_body, tuple):
+                to_display = self.display_body[0] % self.display_body[1]
+            else:
+                to_display = self.display_body()
+
+            to_display = f'[{self.get_time_line()}|status] {to_display}'
+            self.status_bar.display(to_display + (' ' * (self.max_display - len(to_display))) + '\r')
+            self.max_display = len(to_display)
 
     async def process_trade(self, graph: GraphRS, copy_time: float):
         try:
@@ -1017,22 +1032,22 @@ class Overman:
                 # TRADE
                 if profit_koef >= 1:
                     self.display(
-                        f'Current profit {profit_koef:.4f}, '
-                        f'ct: {profit_time:.6f}, cct {cpu_profit_time:.6f}, copy time: {copy_time:.6f}',
-                        throttling=50,
+                        'Current profit %.4f, '
+                        'ct: %.6f, cct %.6f, copy time: %.6f',
+                        profit_koef, profit_time, cpu_profit_time, copy_time
                     )
                 else:
                     # self.display(
-                    #     f'I want to trade! Current profit {profit_koef:.4f}, '
-                    #     f'ct: {profit_time:.5f}, cct {cpu_profit_time:.5f}, copy time: {copy_time:.5f}',
-                    #     throttling=10,
+                    #     'I want to trade! Current profit %.4f, '
+                    #     'ct: %.5f, cct %.5f, copy time: %.5f',
+                    #     profit_koef, profit_time, cpu_profit_time, copy_time
                     # )
                     # return
                     res = await self.trade_cycle(cycle, profit_koef, profit_time)
                     if res.need_to_log:
                         self.result_logger.info(res.one_line_status())
                     else:
-                        self.display_f(res.one_line_status, throttling=10)
+                        self.display_f(res.one_line_status)
 
                     if res.started:
                         self.was_traded = True
@@ -1508,9 +1523,9 @@ class Overman:
                 break
 
             self.display(
-                f'[{trade_unit.origin_coin} -> {trade_unit.dest_coin}] '
-                f'Order is active for now! Waiting timeout ({trade_timeout})...',
-                throttling=100
+                f'[%s -> %s] '
+                f'Order is active for now! Waiting timeout (%s)...',
+                trade_unit.origin_coin, trade_unit.dest_coin, trade_timeout
             )
             await asyncio.sleep(0)
             continue
