@@ -221,7 +221,10 @@ class Overman:
         self.is_on_trade: bool = False
         self.was_traded = False
 
-        self.config = Config.read_config('../config.yaml')
+        try:
+            self.config = Config.read_config('./config.yaml')
+        except FileNotFoundError:
+            self.config = Config.read_config('../config.yaml')
 
         self.last_profit = -1
         self.profit_life_start = 0
