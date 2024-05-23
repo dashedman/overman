@@ -3,9 +3,10 @@ import base64
 import hashlib
 import hmac
 import random
+import sys
 import time
 import uuid
-from collections import defaultdict, deque
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
 from functools import cached_property
@@ -23,11 +24,11 @@ from sortedcontainers import SortedDict
 
 from tqdm import tqdm
 
-import bot.logger
-from bot import utils
-from bot.config import Config
-from bot.exceptions import RequestException, BalanceInsufficientError, OrderSizeTooSmallError, OrderCanceledError
-from bot.graph import Graph, GraphNode, Edge, Cycle
+from . import logger
+from . import utils
+from .config import Config
+from .exceptions import RequestException, BalanceInsufficientError, OrderSizeTooSmallError, OrderCanceledError
+from .graph import Graph, GraphNode, Edge, Cycle
 import dto
 
 
@@ -238,11 +239,11 @@ class Overman:
 
     @cached_property
     def logger(self):
-        return bot.logger.setup_logger('main', with_root=True)
+        return logger.setup_logger('main', with_root=True)
 
     @cached_property
     def result_logger(self):
-        return bot.logger.setup_logger('result')
+        return logger.setup_logger('result')
 
     @cached_property
     def pivot_indexes(self):
