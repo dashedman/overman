@@ -9,3 +9,6 @@ PyYAML~=6.0.1
 asciichartpy
 maturin
 sortedcontainers
+
+winloop; platform_system == "Windows"
+uvloop; platform_system == "Linux"

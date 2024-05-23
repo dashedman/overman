@@ -2,6 +2,7 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import json
 import random
 import sys
 import time
@@ -186,6 +187,7 @@ class Overman:
     graph: Graph | GraphRS
     loop: asyncio.AbstractEventLoop
     stat_counter: int = 0
+    stat_counter_2: int = 0
     handle_sum: float = 0.0
     start_running: float = -1
     tickers_to_pairs: dict[str, tuple[str, str]]
@@ -239,6 +241,7 @@ class Overman:
     @cached_property
     def session(self):
         return aiohttp.ClientSession(json_serialize=orjson.dumps)
+        # return aiohttp.ClientSession()
 
     @cached_property
     def logger(self):
@@ -315,7 +318,13 @@ class Overman:
 
     def run(self):
         try:
-            asyncio.run(self.serve(), debug=True)
+            if sys.platform in ('win32', 'cygwin', 'cli'):
+                from winloop import run
+            else:
+                # if we're on apple or linux do this instead
+                from uvloop import run
+            run(self.serve(), debug=True)
+            # asyncio.run(self.serve(), debug=True)
         except KeyboardInterrupt:
             self.logger.info('Ended by keyboard interrupt')
 
@@ -330,14 +339,16 @@ class Overman:
 
         # starting to listen sockets
         # max 100 tickers per connection
-        ticker_chunks = utils.chunk(self.tickers_to_pairs.keys(), 80)
+        tickers = list(self.tickers_to_pairs.keys())
+        random.shuffle(tickers)
+        ticker_chunks = utils.chunk(tickers, 20)
 
         if True:
             tasks = [
                 asyncio.create_task(self.market_monitor_socket(ch))
                 for ch in ticker_chunks
             ]
-            tasks.append(asyncio.create_task(self.fetch_order_books(4)))
+            tasks.append(asyncio.create_task(self.fetch_order_books(1)))
         else:
             tasks = [
                 asyncio.create_task(self.monitor_socket(ch))
@@ -426,13 +437,15 @@ class Overman:
                 last_ping = time.time()
                 if subs:
                     sub = self.prepare_sub(subs)
-                    pairs = orjson.dumps(sub).decode()
+                    pairs = json.dumps(sub)
+                    # pairs = orjson.dumps(sub).decode()
                     await sock.send(pairs)
 
                 while True:
                     try:
                         orderbook_raw: str = await sock.recv()
-                        orderbook: dict = orjson.loads(orderbook_raw)
+                        orderbook: dict = json.loads(orderbook_raw)
+                        # orderbook: dict = orjson.loads(orderbook_raw)
                         if orderbook.get('code') == 401:
                             self.logger.info("Token has been expired")
                             await self.reload_token()
@@ -445,10 +458,14 @@ class Overman:
                                 pass
 
                         if last_ping + self._ping_interval * 0.8 < time.time():
-                            await sock.send(orjson.dumps({
+                            # await sock.send(orjson.dumps({
+                            #     'id': str(self.next_ws_id()),
+                            #     'type': 'ping'
+                            # }).decode())
+                            await sock.send(json.dumps({
                                 'id': str(self.next_ws_id()),
                                 'type': 'ping'
-                            }).decode())
+                            }))
                             last_ping = time.time()
                     except websockets.ConnectionClosed as e:
                         self.logger.error('Catch error from websocket: %s', e, exc_info=e)
@@ -463,41 +480,51 @@ class Overman:
     async def market_monitor_socket(self, subs: tuple[str]):
         url = f"wss://ws-api-spot.kucoin.com/?token={await self.token()}"
         async for sock in websockets.connect(url, ping_interval=None):
+            # asyncio.create_task(self.deffer_fetch_order_books(subs, 5))
+            self.logger.info('Starting WebSoket for %s', subs)
+
             try:
                 last_ping = time.time()
                 if subs:
                     sub = self.prepare_market_sub(subs)
+                    # pairs = json.dumps(sub)
                     pairs = orjson.dumps(sub).decode()
                     await sock.send(pairs)
 
                 while True:
                     try:
-                        try:
-                            async with asyncio.timeout(self._ping_interval * 0.2):
-                                changes_raw: str = await sock.recv()
-                        except TimeoutError:
-                            pass
-                        else:
-                            changes: dict = orjson.loads(changes_raw)
-                            if changes.get('code') == 401:
-                                self.logger.info("Token has been expired")
-                                await self.reload_token()
-                                self.logger.info("Token reloaded")
-                            else:
-                                if 'data' in changes:
-                                    self.handle_raw_changes_data(changes['data'])
-                                else:
-                                    # pprint(changes)
-                                    pass
+                        changes_raw: str = await sock.recv()
 
-                        if last_ping + self._ping_interval * 0.6 < time.time():
-                            await sock.send(orjson.dumps({
-                                'id': str(self.next_ws_id()),
-                                'type': 'ping'
-                            }).decode())
+                        # changes: dict = json.loads(changes_raw)
+                        self.stat_counter_2 += 1
+                        changes: dict = orjson.loads(changes_raw)
+                        if changes.get('code') == 401:
+                            self.logger.info("Token has been expired")
+                            await self.reload_token()
+                            self.logger.info("Token reloaded")
+                        else:
+                            if 'data' in changes:
+                                self.handle_raw_changes_data(changes['data'])
+                                # pass
+                            else:
+                                # pprint(changes)
+                                pass
+
+                        if last_ping + self._ping_interval * 0.8 < time.time():
+                            # await sock.send(json.dumps({
+                            #     'id': str(self.next_ws_id()),
+                            #     'type': 'ping'
+                            # }))
+                            asyncio.create_task(
+                                sock.send(orjson.dumps({
+                                    'id': str(self.next_ws_id()),
+                                    'type': 'ping'
+                                }).decode())
+                            )
                             last_ping = time.time()
                     except websockets.ConnectionClosed as e:
-                        self.logger.error('Catch error from websocket: %s', e, exc_info=e)
+                        self.logger.error('Catch error from websocket: %s, for tickers %s', e, subs)
+                        break
                     except Exception as e:
                         self.logger.error(
                             'Catch error while monitoring socket:\n',
@@ -506,6 +533,8 @@ class Overman:
             except websockets.ConnectionClosed as e:
                 self.logger.error('websocket error: %s', e)
 
+            asyncio.create_task(self.deffer_fetch_order_books(subs))
+
     async def orders_socket(self):
         url = f"wss://ws-api-spot.kucoin.com/?token={await self.private_token()}"
         async for sock in websockets.connect(url, ping_interval=None):
@@ -513,7 +542,8 @@ class Overman:
                 last_ping = time.time()
 
                 subscribe_msg = self.prepare_orders_topic()
-                subscribe_msg_raw = orjson.dumps(subscribe_msg).decode()
+                # subscribe_msg_raw = orjson.dumps(subscribe_msg).decode()
+                subscribe_msg_raw = json.dumps(subscribe_msg)
                 await sock.send(subscribe_msg_raw)
 
                 while True:
@@ -525,6 +555,7 @@ class Overman:
                             pass
                         else:
                             order_result: dict = orjson.loads(order_result_raw)
+                            # order_result: dict = json.loads(order_result_raw)
                             if order_result.get('code') == 401:
                                 self.logger.info("Token has been expired")
                                 await self.reload_private_token()
@@ -541,9 +572,14 @@ class Overman:
                                 'id': str(self.next_ws_id()),
                                 'type': 'ping'
                             }).decode())
+                            # await sock.send(json.dumps({
+                            #     'id': str(self.next_ws_id()),
+                            #     'type': 'ping'
+                            # }))
                             last_ping = time.time()
                     except websockets.ConnectionClosed as e:
-                        self.logger.error('Catch error from websocket: %s', e, exc_info=e)
+                        self.logger.error('Catch error from websocket: %s', e)
+                        break
                     except Exception as e:
                         self.logger.error(
                             'Catch error while monitoring socket:\n',
@@ -746,6 +782,16 @@ class Overman:
         ticker_chunks = utils.chunk(self.tickers_to_pairs.keys(), 50)
         for tc in tqdm(ticker_chunks, postfix='Full Order books loaded', ascii=True):
             await asyncio.gather(*(self.get_full_order_book(ticker) for ticker in tc))
+
+    async def deffer_fetch_order_books(self, tickers: list[str]):
+        for ticker in tickers:
+            if ticker in self.init_market_cache:
+                del self.init_market_cache[ticker]
+            if ticker in self.order_book_by_ticker:
+                del self.order_book_by_ticker[ticker]
+
+        self.logger.info('Restore full orders books for %s pairs', tickers)
+        await asyncio.gather(*(self.get_full_order_book(ticker) for ticker in tickers))
 
     async def get_full_order_book(self, symbol: str):
         data = await self.do_request(
@@ -1642,45 +1688,49 @@ class Overman:
         url = 'https://api.kucoin.com' + endpoint
         # url = 'https://openapi-sandbox.kucoin.com' + endpoint
 
-        if private:
-            timestamp = int(time.time() * 1000) # + self.server_time_correction  # convert to milliseconds
-            request_sign = self.signature(
-                timestamp, method,
-                endpoint + raw_params,
-                raw_data
+        for _ in range(3):
+            if private:
+                timestamp = int(time.time() * 1000) # + self.server_time_correction  # convert to milliseconds
+                request_sign = self.signature(
+                    timestamp, method,
+                    endpoint + raw_params,
+                    raw_data
+                )
+
+                headers = self.auth_headers(timestamp, request_sign.decode('ascii'))
+            else:
+                headers = {}
+
+            request = self.session.request(
+                method, url,
+                params=params,
+                data=raw_data,
+                headers=headers,
             )
+            async with request as resp:
+                if resp.status != 200:
+                    self.logger.error('Catch %s HTTP code while %s: %s',
+                                      resp.status, url, await resp.read())
+                    # raise Exception('bad request')
+                data_json = await resp.json(loads=orjson.loads)
+                resp_code = int(data_json['code'])
 
-            headers = self.auth_headers(timestamp, request_sign.decode('ascii'))
-        else:
-            headers = {}
+                if resp_code == 200000:
+                    return data_json['data']
+                if resp_code == 200004:
+                    raise BalanceInsufficientError(data_json['msg'])
+                if resp_code == 400002:
+                    continue
+                if resp_code == 400100:
+                    if 'Order size below the minimum requirement' in data_json['msg']:
+                        raise OrderSizeTooSmallError(data_json['msg'])
 
-        request = self.session.request(
-            method, url,
-            params=params,
-            data=raw_data,
-            headers=headers,
-        )
-        async with request as resp:
-            if resp.status != 200:
-                self.logger.error('Catch %s HTTP code while %s: %s',
-                                  resp.status, url, await resp.read())
-                raise Exception('bad request')
-            data_json = await resp.json(loads=orjson.loads)
-            resp_code = int(data_json['code'])
-
-            if resp_code == 200000:
-                return data_json['data']
-            if resp_code == 200004:
-                raise BalanceInsufficientError(data_json['msg'])
-            if resp_code == 400100:
-                if 'Order size below the minimum requirement' in data_json['msg']:
-                    raise OrderSizeTooSmallError(data_json['msg'])
-
-            self.logger.error(
-                'Catch %s API code while %s: %s',
-                data_json['code'], url, data_json['msg']
-            )
-            raise RequestException(data_json['msg'])
+                self.logger.error(
+                    'Catch %s API code while %s: %s',
+                    data_json['code'], url, data_json['msg']
+                )
+                raise RequestException(data_json['msg'])
+        raise Exception(f'Cannot do request cause {data_json}')
 
     def signature(self, timestamp: int, method: str, endpoint: str, data: bytes):
         return base64.b64encode(
@@ -1935,11 +1985,13 @@ class Overman:
     async def status_monitor(self):
         while True:
             self.logger.info(
-                'Asyncio tasks: %d. %.3f rps. %.6f spr',
+                'Asyncio tasks: %d. %.3f rps. %.6f spr. %d req count',
                 len(asyncio.all_tasks()),
                 self.stat_counter / (time.perf_counter() - self.start_running),
-                self.handle_sum / self.stat_counter if self.stat_counter > 0 else 0
+                self.handle_sum / self.stat_counter if self.stat_counter > 0 else 0,
+                self.stat_counter_2
             )
+            self.stat_counter_2 = 0
             if self.stat_counter > 50000:
                 self.stat_counter = 0
                 self.handle_sum = 0
