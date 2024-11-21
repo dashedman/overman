@@ -266,6 +266,7 @@ impl GraphRS {
         &mut self, 
         py: Python,
         base_nodes: Bound<PyList>,
+        max_cycle_depth: usize,
     ) -> PyResult<()> {
         let nodes_len = self.nodes.bind(py).borrow().vec.len();
         let mut nodes_in_cycle = HashSet::new();
@@ -274,7 +275,7 @@ impl GraphRS {
         for base_node_pa in base_nodes.iter() {
             let base_node = base_node_pa.downcast::<GraphNodeRS>()?.borrow();
 
-            for node in self.get_nodes_in_cycles(py, base_node.index, 4)? {
+            for node in self.get_nodes_in_cycles(py, base_node.index, max_cycle_depth)? {
                 nodes_in_cycle.insert(node);
             }
         }
@@ -304,14 +305,19 @@ impl GraphRS {
     fn check_profit_experimental_3(
         &self, 
         py: Python,
-        pivot_indexes: Bound<PyList>
+        pivot_indexes: Bound<PyList>,
+        max_cycle_depth: usize,
     ) -> PyResult<Option<(f64, CycleRS, f64)>> {
         let now = std::time::Instant::now();
 
         let mut best_profit = 10000000.0;
         let mut best_cycle = None;
         for pivot_coin_index in pivot_indexes.iter() {
-            let (profit, cycle_opt) = self.get_profit_3(py, pivot_coin_index.extract::<usize>()?)?;
+            let (profit, cycle_opt) = self.get_profit_3(
+                py,
+                pivot_coin_index.extract::<usize>()?,
+                max_cycle_depth
+            )?;
 
             match cycle_opt {
                 Some(cycle) => {
@@ -339,7 +345,7 @@ impl GraphRS {
     
 
     // async fn get_profit_3_async<'py>(&self, start: usize) -> PyResult<(f64, Option<CycleRS>)> {
-    fn get_profit_3(&self, py: Python, start: usize) -> PyResult<(f64, Option<CycleRS>)> {
+    fn get_profit_3(&self, py: Python, start: usize, max_depth: usize) -> PyResult<(f64, Option<CycleRS>)> {
         let bound_nodes = self.nodes.bind(py).borrow();
         
         let mut koef_in_node = vec![100000000.0; bound_nodes.vec.len()];
@@ -376,10 +382,9 @@ impl GraphRS {
 
                 let new_koef = curr_koef * edge.val;
                 let next_index = edge.next_node_index;
-                if new_koef == 0.0 {
-                    continue;
-                }
-                else if curr_visited_before.contains(&next_index)  
+                if new_koef == 0.0 ||
+                    curr_visited_before.len() >= max_depth ||
+                    curr_visited_before.contains(&next_index)
                 {
                     continue;
                 }

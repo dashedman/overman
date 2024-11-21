@@ -264,13 +264,13 @@ class Graph:
     # TODO: get_cycles_with_pair
     # TODO: get_cycles_from_node_with_pair
     # TODO: filter graph from nodes without cycles with base coins
-    def filter_from_noncycle_nodes(self, base_nodes: list[GraphNode]):
+    def filter_from_noncycle_nodes(self, base_nodes: list[GraphNode], max_cycle_length: int):
         nodes_in_cycle = set()
 
         # checked_nodes = [False] * len(self)
         for base_node in base_nodes:
             nodes_in_cycle.update(
-                self.get_nodes_in_cycles(base_node.index, max_length=4)
+                self.get_nodes_in_cycles(base_node.index, max_length=max_cycle_length)
             )
 
             # It's old algo to filter non cycled nodes

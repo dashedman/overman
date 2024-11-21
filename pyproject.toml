@@ -1,0 +1,24 @@
+[project]
+name = "overman"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "aiohttp>=3.11.7",
+    "asciichartpy>=1.5.25",
+    "coloredlogs>=15.0.1",
+    "graph-rs",
+    "maturin>=1.7.4",
+    "orjson>=3.10.11",
+    "pyyaml>=6.0.2",
+    "requests>=2.32.3",
+    "sortedcontainers>=2.4.0",
+    "tqdm>=4.67.0",
+    "uvloop>=0.21.0 ; platform_system == 'Linux'",
+    "websockets>=14.1",
+    "winloop>=0.1.6 ; platform_system == 'Windows'",
+]
+
+[tool.uv.sources]
+graph-rs = { path = "graph-rs", editable = true }

@@ -11,6 +11,7 @@ use crate::graph::node::GraphNodeRS;
 
 #[pyclass(sequence)]
 #[derive(Debug, Clone)]
+#[allow(non_camel_case_types)]
 pub struct Deque_NodeRS_EdgeRS {
     pub vec_deque: VecDeque<(Py<GraphNodeRS>, Py<EdgeRS>)>,
 }

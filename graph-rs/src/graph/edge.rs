@@ -29,6 +29,7 @@ pub struct EdgeRS {
 
 #[pyclass(sequence)]
 #[derive(Debug)]
+#[allow(non_camel_case_types)]
 pub struct Vec_EdgeRS {
     pub vec: Vec<Py<EdgeRS>>,
 }

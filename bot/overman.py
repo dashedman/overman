@@ -44,6 +44,7 @@ class PairInfo:
     baseCurrency: str
     quoteCurrency: str
     feeCurrency: str
+    feeCategory: int
     market: str
     baseMinSize: str
     quoteMinSize: str
@@ -56,6 +57,17 @@ class PairInfo:
     minFunds: str
     isMarginEnabled: bool
     enableTrading: bool
+    makerFeeCoefficient: str
+    takerFeeCoefficient: str
+    st: bool
+    callauctionIsEnabled: bool
+    callauctionPriceFloor: str
+    callauctionPriceCeiling: str
+    callauctionFirstStageStartTime: str
+    callauctionSecondStageStartTime: str
+    callauctionThirdStageStartTime: str
+    tradingStartTime: str
+
 
     @property
     def base_min_size(self):
@@ -125,8 +137,8 @@ class TradeUnit:
             target_size=self.target_size,
             funds_info=self.funds_info,
         )
-    
-    
+
+
 TradeUnitList = list[TradeUnit]
 
 
@@ -202,14 +214,16 @@ class Overman:
     def __init__(
             self,
             pivot_coins: list[str],
-            depth: Literal[1, 50],
+            depth: int,
             prefix: str,
             hf_trade: bool = False,
+            only_show: bool = True
     ):
         self.depth = depth
         self.prefix = prefix
         self.pivot_coins = pivot_coins
         self.hf_trade = hf_trade
+        self.only_show = only_show
 
         self.order_book_by_ticker: dict[str, dto.BestOrders | dto.FullOrders] = {}
         self.__token = None
@@ -222,6 +236,7 @@ class Overman:
         self._ws_id = 0
         self.is_on_trade: bool = False
         self.was_traded = False
+        self.last_proposal_pair = None
 
         try:
             self.config = Config.read_config('./config.yaml')
@@ -366,7 +381,7 @@ class Overman:
             asyncio.create_task(self.display_engine())
         )
 
-        self.result_logger.info('Start trading bot')
+        self.result_logger.info('Start trading bot (Only show: %s)', self.only_show)
         self.start_running = time.perf_counter()
         try:
             await asyncio.gather(*tasks)
@@ -1011,7 +1026,7 @@ class Overman:
             #     graph
             # )
             # experimental_profit = self.check_profit_experimental_3(graph)
-            experimental_profit = graph.check_profit_experimental_3(self.pivot_indexes)
+            experimental_profit = graph.check_profit_experimental_3(self.pivot_indexes, self.depth)
             end_calc = time.perf_counter()
             if experimental_profit:
                 profit_koef, cycle, cpu_profit_time = experimental_profit
@@ -1030,28 +1045,71 @@ class Overman:
                 #     self.profit_life_start = now
 
                 # TRADE
-                if profit_koef >= 1:
+                PROFIT_EDGE = 0.9996
+                PROPOSAL_WAIT = 0.5
+                if profit_koef >= PROFIT_EDGE:
+                    if self.last_proposal_pair:
+                        self.logger.warning(
+                            'Outtime proposal: %.2f sec, %s',
+                            (end_calc - self.last_proposal_pair[1]) - PROPOSAL_WAIT,
+                            self.last_proposal_pair[0]
+                        )
+                        self.last_proposal_pair = None
+
                     self.display(
                         'Current profit %.4f, '
                         'ct: %.6f, cct %.6f, copy time: %.6f',
                         profit_koef, profit_time, cpu_profit_time, copy_time
                     )
                 else:
-                    # self.display(
-                    #     'I want to trade! Current profit %.4f, '
-                    #     'ct: %.5f, cct %.5f, copy time: %.5f',
-                    #     profit_koef, profit_time, cpu_profit_time, copy_time
-                    # )
-                    # return
-                    res = await self.trade_cycle(cycle, profit_koef, profit_time)
-                    if res.need_to_log:
-                        self.result_logger.info(res.one_line_status())
-                    else:
-                        self.display_f(res.one_line_status)
+                    cycle_key = ''.join(f'{node.value} -> ' for node, _ in cycle) + cycle.q[0][0].value
+                    if self.last_proposal_pair is None:
+                        self.logger.info(
+                            'Proposal: %s (wait for %.2f sec)',
+                            cycle_key, PROPOSAL_WAIT
+                        )
+                        self.last_proposal_pair = (cycle_key, end_calc)
 
-                    if res.started:
-                        self.was_traded = True
-                        await self.update_balance()
+                    elif self.last_proposal_pair[0] != cycle_key:
+                        self.logger.warning(
+                            'Mismatch proposal: %.2f sec, %s',
+                            (end_calc - self.last_proposal_pair[1]) - PROPOSAL_WAIT,
+                            cycle_key
+                        )
+                        self.last_proposal_pair = None
+
+                    elif end_calc - self.last_proposal_pair[1] < PROPOSAL_WAIT:
+                        self.display(
+                            '(Proposal wait) Current profit %.4f, '
+                            'ct: %.6f, cct %.6f, copy time: %.6f',
+                            profit_koef, profit_time, cpu_profit_time, copy_time
+                        )
+
+                    elif self.only_show:
+                        self.logger.info(
+                            'Detected trade (%s) '
+                            'Current profit %.4f, ct: %.5f, cct %.5f, copy time: %.5f',
+                            cycle_key,
+                            profit_koef, profit_time, cpu_profit_time, copy_time
+                        )
+                        await asyncio.sleep(PROPOSAL_WAIT)
+                    else:
+                        # self.display(
+                        #     'I want to trade! Current profit %.4f, '
+                        #     'ct: %.5f, cct %.5f, copy time: %.5f',
+                        #     profit_koef, profit_time, cpu_profit_time, copy_time
+                        # )
+                        # return
+                        res = await self.trade_cycle(cycle, profit_koef, profit_time)
+                        if res.need_to_log:
+                            self.result_logger.info(res.one_line_status())
+                        else:
+                            self.display_f(res.one_line_status)
+
+                            if res.started:
+                                self.was_traded = True
+                                self.last_proposal_pair = None
+                                await self.update_balance()
         finally:
             self.is_on_trade = False
 
@@ -1364,7 +1422,7 @@ class Overman:
         ).quantize(pair_info.quote_increment, default_rounding)
 
         return predict_results
-    
+
     async def validate_dead_prices(self, trade_units: TradeUnitList):
         there_is_dead_price = None
         await asyncio.sleep(0.5)
@@ -1992,7 +2050,7 @@ class Overman:
         pivot_nodes = [
             node for node in node_list if node.value in self.pivot_coins
         ]
-        self.graph.filter_from_noncycle_nodes(pivot_nodes)
+        self.graph.filter_from_noncycle_nodes(pivot_nodes, self.depth)
 
         filtered_pairs = [
             (node.value, self.graph[edge.next_node_index].value)

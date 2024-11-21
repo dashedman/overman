@@ -63,6 +63,7 @@ impl fmt::Display for GraphNodeRS {
 
 #[pyclass(sequence)]
 #[derive(Debug)]
+#[allow(non_camel_case_types)]
 pub struct Vec_NodeRS {
     pub vec: Vec<Py<GraphNodeRS>>,
 }
