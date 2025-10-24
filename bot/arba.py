@@ -206,6 +206,13 @@ class Arba(Overman):
                 pair = self.tickers_to_pairs[data_unit['symbol']]
                 self.pair_to_fee[pair] = Decimal(data_unit['takerFeeRate'])
 
+    async def get_trade_fees(self, symbols: tuple[str]) -> list[dict[str, Any]]:
+        return await self.do_request(
+            'GET', '/api/v1/trade-fees',
+            params={'symbols': ','.join(symbols)},
+            private=True,
+        )
+
     async def monitor_socket(self, subs: tuple[str]):
         url = f"wss://ws-api-spot.kucoin.com/?token={await self.token()}"
         async for sock in websockets.connect(url, ping_interval=None):

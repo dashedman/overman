@@ -1,6 +1,13 @@
-from pydantic import Field
+import asyncio
+from decimal import Decimal
+from itertools import chain
+from typing import Any
 
-from .overman import Overman, PairInfo
+from pydantic import Field
+from tqdm import tqdm
+
+from . import utils
+from .overman import Overman, PairInfo, BaseCoin, QuoteCoin
 
 
 class FutPairInfo(PairInfo):
@@ -95,3 +102,60 @@ class Funda(Overman):
         if sort_best:
             return sorted(symbols, key=lambda sym: abs(sym.funding_fee_rate), reverse=True)
         return symbols
+
+    async def load_tickers(self):
+        pairs_infos = await self.get_funding_fee_symbols()
+
+        self.tickers_to_pairs: dict[str, tuple[BaseCoin, QuoteCoin]] = {
+            p.symbol: (p.base_currency, p.quote_currency)
+            for p in pairs_infos
+        }
+        self.pairs_to_tickers: dict[tuple[BaseCoin, QuoteCoin], str] = {
+            pair: ticker for ticker, pair in self.tickers_to_pairs.items()
+        }
+        self.pairs_info: dict[tuple[BaseCoin, QuoteCoin], PairInfo] = {
+            pair: pair_info
+            for pair_info in pairs_infos
+            if (pair := self.tickers_to_pairs.get(pair_info.symbol))
+        }
+
+        self.logger.info('Loaded %s pairs', len(pairs_infos))
+
+    async def get_trade_fees(self, symbols: tuple[str]) -> list[dict[str, Any]]:
+        return await self.do_fut_request(
+            'GET', '/api/v1/trade-fees',
+            params={'symbols': ','.join(symbols)},
+            private=True,
+        )
+
+    async def load_fees(self):
+        # loading fees
+        # max 10 tickers per connection
+        self.pair_to_fee = {}
+        ticker_chunks = utils.chunk(self.tickers_to_pairs.keys(), 150)
+
+        while True:
+            self.logger.info('Trying to get first fees info.')
+            try:
+                data = await self.get_trade_fees(ticker_chunks[0][:1])
+                if data:
+                    break
+            except Exception as e:
+                self.logger.warning(f'Catch {e}. Trying again. Sleep 60 sec')
+            await asyncio.sleep(60)
+
+        for chunks in tqdm(ticker_chunks, postfix='fees loaded', ascii=True):
+            data_chunks = await asyncio.gather(*(
+                self.get_trade_fees(subchunk)
+                for subchunk in utils.chunk(chunks, 10)
+            ))
+            data = chain.from_iterable(data_chunks)
+            for data_unit in data:
+                pair = self.tickers_to_pairs[data_unit['symbol']]
+                self.pair_to_fee[pair] = Decimal(data_unit['takerFeeRate'])
+
+    async def serve(self):
+        await self.load_tickers()
+        await self.load_fees()
+
+        print()

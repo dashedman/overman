@@ -26,8 +26,8 @@ from . import utils
 from .config import Config
 from .exceptions import RequestException, BalanceInsufficientError, OrderSizeTooSmallError
 
-BaseCoin = NewType('BaseCoin', str)
-QuoteCoin = NewType('QuoteCoin', str)
+BaseCoin = str
+QuoteCoin = str
 
 
 class PairInfo(BaseModel):
@@ -219,14 +219,19 @@ class Overman:
         self._ws_id = (self._ws_id + 1) % 1000000000
         return self._ws_id
 
-    def run(self):
+    async def run(self):
+        async with self:
+            await self.serve()
+
+    def run_sync(self):
         try:
             if sys.platform in ('win32', 'cygwin', 'cli'):
                 from winloop import run
             else:
                 # if we're on apple or linux do this instead
                 from uvloop import run
-            run(self.serve(), debug=True)
+
+            run(self.run(), debug=True)
             # asyncio.run(self.serve(), debug=True)
         except KeyboardInterrupt:
             self.logger.info('Ended by keyboard interrupt')
@@ -816,12 +821,9 @@ class Overman:
         )
         return self.get_order_book_from_raw(data)
 
+    @abstractmethod
     async def get_trade_fees(self, symbols: tuple[str]) -> list[dict[str, Any]]:
-        return await self.do_request(
-            'GET', '/api/v1/trade-fees',
-            params={'symbols': ','.join(symbols)},
-            private=True,
-        )
+        pass
 
     async def inner_transfer(
             self,
