@@ -1,36 +1,28 @@
 import asyncio
-from datetime import datetime, UTC, timedelta
-from pprint import pprint
+from datetime import timedelta
 
-from bot.overman import Overman
+from bot.funda import Funda, FutPairInfo
 
 
-def get_avg_rate(symbols):
-    return sum(abs(sym['fundingFeeRate']) for sym in symbols) / len(symbols)
+def get_avg_rate(symbols: list[FutPairInfo]):
+    return sum(abs(sym.funding_fee_rate) for sym in symbols) / len(symbols)
 
 
 async def main():
-    async with Overman(depth=50, prefix='orderbook', pivot_coins=[]) as app:
-        symbols = await app.do_fut_request('GET', '/api/v1/contracts/active')
-
-        symbols = [
-            s
-            for s in symbols
-            if s['fundingFeeRate'] is not None and s['expireDate'] is None
-        ]
-
-        best_funds = sorted(symbols, key=lambda sym: abs(sym['fundingFeeRate'] or 0), reverse=True)
+    async with Funda() as app:
+        best_funds = await app.get_funding_fee_symbols(sort_best=True)
 
         print('Check history you can here: https://www.kucoin.com/order/futures/funds-history')
-        print(f'TOP 3 AVG RAtE: {get_avg_rate(best_funds[:3]) * 100:.2f}%')
-        print(f'TOP 5 AVG RAtE: {get_avg_rate(best_funds[:5]) * 100:.2f}%')
-        print(f'TOP 10 AVG RAtE: {get_avg_rate(best_funds[:10]) * 100:.2f}%')
-        print(f'TOP 20 AVG RAtE: {get_avg_rate(best_funds[:20]) * 100:.2f}%')
+        print(f'TOP 3 AVG RATE: {get_avg_rate(best_funds[:3]) * 100:.2f}%')
+        print(f'TOP 5 AVG RATE: {get_avg_rate(best_funds[:5]) * 100:.2f}%')
+        print(f'TOP 10 AVG RATE: {get_avg_rate(best_funds[:10]) * 100:.2f}%')
+        print(f'TOP 20 AVG RATE: {get_avg_rate(best_funds[:20]) * 100:.2f}%')
+        print(f'Minimal fee: {best_funds[-1].funding_fee_rate * 100}%')
         for sym in best_funds[:20]:
-            title = sym['symbol']
-            rate = sym['fundingFeeRate'] * 100
-            countdown = timedelta(milliseconds=sym['nextFundingRateTime']).total_seconds() // 60
-            url = f'https://www.kucoin.com/trade/futures/{sym['symbol']}'
+            title = sym.symbol
+            rate = sym.funding_fee_rate * 100
+            countdown = timedelta(milliseconds=sym.next_funding_rate_time).total_seconds() // 60
+            url = f'https://www.kucoin.com/trade/futures/{sym.symbol}'
             print(f'{title}: {rate:.2f}% in {countdown} min - {url}')
 
 

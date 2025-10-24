@@ -15,6 +15,8 @@ from typing import Literal, Any, NewType, Callable
 
 import aiohttp as aiohttp
 import orjson as orjson
+from pydantic import BaseModel
+from pydantic.alias_generators import to_camel
 from sortedcontainers import SortedDict
 from tqdm import tqdm
 
@@ -28,73 +30,43 @@ BaseCoin = NewType('BaseCoin', str)
 QuoteCoin = NewType('QuoteCoin', str)
 
 
-@dataclass
-class PairInfo:
+class PairInfo(BaseModel):
+    class Config:
+        alias_generator = to_camel
+        extra = 'forbid'
+
     symbol: str
+    base_currency: str
+    quote_currency: str
+
+
+class SpotPairInfo(PairInfo):
     name: str
-    baseCurrency: str
-    quoteCurrency: str
-    feeCurrency: str
-    feeCategory: int
+    fee_currency: str
+    fee_category: int
     market: str
-    baseMinSize: str
-    quoteMinSize: str
-    baseMaxSize: str
-    quoteMaxSize: str
-    baseIncrement: str
-    quoteIncrement: str
-    priceIncrement: str
-    priceLimitRate: str
-    minFunds: str
-    isMarginEnabled: bool
-    enableTrading: bool
-    makerFeeCoefficient: str
-    takerFeeCoefficient: str
+    base_min_size: str
+    quote_min_size: str
+    base_max_size: str
+    quote_max_size: str
+    base_increment: str
+    quote_increment: str
+    price_increment: str
+    price_limit_rate: str
+    min_funds: str
+    is_margin_enabled: bool
+    enable_trading: bool
+    maker_fee_coefficient: str
+    taker_fee_coefficient: str
     st: bool
-    callauctionIsEnabled: bool
-    callauctionPriceFloor: str
-    callauctionPriceCeiling: str
-    callauctionFirstStageStartTime: str
-    callauctionSecondStageStartTime: str
-    callauctionThirdStageStartTime: str
-    tradingStartTime: str
+    callauction_is_enabled: bool
+    callauction_price_floor: str
+    callauction_price_ceiling: str
+    callauction_first_stage_start_time: str
+    callauction_second_stage_start_time: str
+    callauction_third_stage_start_time: str
+    trading_start_time: str
 
-
-    @property
-    def base_min_size(self):
-        return Decimal(self.baseMinSize)
-
-    @property
-    def quote_min_size(self):
-        return Decimal(self.quoteMinSize)
-
-    @property
-    def base_max_size(self):
-        return Decimal(self.baseMaxSize)
-
-    @property
-    def quote_max_size(self):
-        return Decimal(self.quoteMaxSize)
-
-    @property
-    def base_increment(self):
-        return Decimal(self.baseIncrement)
-
-    @property
-    def quote_increment(self):
-        return Decimal(self.quoteIncrement)
-
-    @property
-    def price_increment(self):
-        return Decimal(self.priceIncrement)
-
-    @property
-    def quote_limit_rate(self):
-        return Decimal(self.priceLimitRate)
-
-    @property
-    def min_funds(self):
-        return Decimal(self.minFunds)
 
 
 @dataclass(kw_only=True)
@@ -277,105 +249,6 @@ class Overman:
         self.server_time_correction = (server_time - my_time) // 2
         self.logger.info('Server timestamp %s, Local timestamp %s, Time Correction %s',
                          server_time, my_time, self.server_time_correction)
-
-    def handle_raw_orderbook_data(
-            self,
-            raw_orderbook: dict[str, str | dict[str, int | list[list[str]]]]
-    ):
-        """
-        {
-             'asks': [['0.00006792', '4.9846'], ['0.00006793', '90.9062'],
-            ['0.00006798', '39.9709'], ['0.00006799', '0.7342'], ['0.00006802',
-            '6.8374']],
-             'bids': [['0.00006781', '49.4415'], ['0.0000678',
-            '2.5265'], ['0.00006771', '90.2718'], ['0.00006764', '271.9394'],
-            ['0.00006758', '2.5348']],
-             'timestamp': 1688157998591
-         }
-         "Ask" (предложение о продаже) - это цена, по которой продавец готов
-         продать определенное количество акций или других ценных бумаг.
-
-         "Bid" (предложение о покупке) - это цена, по которой покупатель готов
-          купить определенное количество акций или других ценных бумаг.
-        """
-        self.stat_counter += 1
-
-        ticker = raw_orderbook['topic'].split(':')[-1]
-        ob_data: dict[str, list[list[str]]] = raw_orderbook['data']
-        order_book = self.order_book_by_ticker[ticker] = \
-            self.get_order_book_from_raw(ob_data)
-
-        self.logger.debug(
-            'symbol: %s, data: %s',
-            ticker, self.order_book_by_ticker[ticker]
-        )
-        if order_book.is_relevant:
-            pair = self.tickers_to_pairs[ticker]
-            pair_info = self.pairs_info[pair]
-            pair_fee = self.pair_to_fee[pair]
-            min_funds = Decimal(pair_info.minFunds)
-            min_size = Decimal(pair_info.baseMinSize)
-
-            ask, bid = self.tune_to_size_n_funds(min_size, min_funds, order_book)
-            self.update_graph(pair, ask, fee=pair_fee)
-            self.update_graph(pair, bid, fee=pair_fee, inverted=True)
-            self.trigger_trade()
-
-    def handle_raw_changes_data(
-            self,
-            changes_data: dict[str, str | int | dict[str, list[list[str]]]]
-    ):
-        """
-        {
-            "changes": {
-              "asks": [
-                [
-                  "18906", //price
-                  "0.00331", //size
-                  "14103845" //sequence
-                ],
-                ["18907.3", "0.58751503", "14103844"]
-              ],
-              "bids": [["18891.9", "0.15688", "14103847"]]
-            },
-            "sequenceEnd": 14103847,
-            "sequenceStart": 14103844,
-            "symbol": "BTC-USDT",
-            "time": 1663747970273 //milliseconds
-        }
-         "Ask" (предложение о продаже) - это цена, по которой продавец готов
-         продать определенное количество акций или других ценных бумаг.
-
-         "Bid" (предложение о покупке) - это цена, по которой покупатель готов
-          купить определенное количество акций или других ценных бумаг.
-        """
-        self.stat_counter += 1
-        start_handle = time.perf_counter()
-
-        ticker = changes_data['symbol']
-        order_book = self.update_order_book_by_changes(
-            ticker,
-            changes_data['changes'],
-            changes_data['sequenceEnd']
-        )
-
-        self.logger.debug(
-            'symbol: %s, data: %s',
-            ticker, order_book
-        )
-        if order_book and order_book.is_relevant:
-            pair = self.tickers_to_pairs[ticker]
-            pair_info = self.pairs_info[pair]
-            pair_fee = self.pair_to_fee[pair]
-            min_funds = Decimal(pair_info.minFunds)
-            min_size = Decimal(pair_info.baseMinSize)
-
-            ask, bid = self.tune_to_size_n_funds_full(min_size, min_funds, order_book)
-            self.graph.update_graph_edge(pair, ask, fee=pair_fee)
-            self.graph.update_graph_edge(pair, bid, fee=pair_fee, inverted=True)
-            self.trigger_trade()
-
-        self.handle_sum += time.perf_counter() - start_handle
 
     def handle_order_event(
             self,

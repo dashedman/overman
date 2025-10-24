@@ -1,35 +1,24 @@
 import asyncio
-import base64
-import hashlib
-import hmac
 import json
 import random
-import sys
 import time
-import uuid
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import datetime
 from decimal import Decimal, ROUND_HALF_DOWN
 from functools import cached_property
 from itertools import chain
-from typing import Literal, Any, Callable
 
-import aiohttp as aiohttp
 import asciichartpy
 import orjson as orjson
 import websockets
 from graph_rs import EdgeRS, GraphNodeRS, GraphRS
-from sortedcontainers import SortedDict
 from tqdm import tqdm
 
 import dto
-from . import logger
 from . import utils
-from .config import Config
-from .exceptions import RequestException, BalanceInsufficientError, OrderSizeTooSmallError, OrderCanceledError
+from .exceptions import BalanceInsufficientError, OrderCanceledError
 from .graph import Graph, Cycle
-from .overman import Overman, TradeUnitList, TradeUnit, BaseCoin, QuoteCoin
+from .overman import Overman, TradeUnitList, TradeUnit, BaseCoin, QuoteCoin, PairInfo
 
 
 @dataclass(kw_only=True)
@@ -374,6 +363,106 @@ class Arba(Overman):
                         break
             except websockets.ConnectionClosed as e:
                 self.logger.error('websocket error: %s', e)
+
+
+    def handle_raw_orderbook_data(
+            self,
+            raw_orderbook: dict[str, str | dict[str, int | list[list[str]]]]
+    ):
+        """
+        {
+             'asks': [['0.00006792', '4.9846'], ['0.00006793', '90.9062'],
+            ['0.00006798', '39.9709'], ['0.00006799', '0.7342'], ['0.00006802',
+            '6.8374']],
+             'bids': [['0.00006781', '49.4415'], ['0.0000678',
+            '2.5265'], ['0.00006771', '90.2718'], ['0.00006764', '271.9394'],
+            ['0.00006758', '2.5348']],
+             'timestamp': 1688157998591
+         }
+         "Ask" (предложение о продаже) - это цена, по которой продавец готов
+         продать определенное количество акций или других ценных бумаг.
+
+         "Bid" (предложение о покупке) - это цена, по которой покупатель готов
+          купить определенное количество акций или других ценных бумаг.
+        """
+        self.stat_counter += 1
+
+        ticker = raw_orderbook['topic'].split(':')[-1]
+        ob_data: dict[str, list[list[str]]] = raw_orderbook['data']
+        order_book = self.order_book_by_ticker[ticker] = \
+            self.get_order_book_from_raw(ob_data)
+
+        self.logger.debug(
+            'symbol: %s, data: %s',
+            ticker, self.order_book_by_ticker[ticker]
+        )
+        if order_book.is_relevant:
+            pair = self.tickers_to_pairs[ticker]
+            pair_info = self.pairs_info[pair]
+            pair_fee = self.pair_to_fee[pair]
+            min_funds = Decimal(pair_info.min_funds)
+            min_size = Decimal(pair_info.baseMinSize)
+
+            ask, bid = self.tune_to_size_n_funds(min_size, min_funds, order_book)
+            self.update_graph(pair, ask, fee=pair_fee)
+            self.update_graph(pair, bid, fee=pair_fee, inverted=True)
+            self.trigger_trade()
+
+    def handle_raw_changes_data(
+            self,
+            changes_data: dict[str, str | int | dict[str, list[list[str]]]]
+    ):
+        """
+        {
+            "changes": {
+              "asks": [
+                [
+                  "18906", //price
+                  "0.00331", //size
+                  "14103845" //sequence
+                ],
+                ["18907.3", "0.58751503", "14103844"]
+              ],
+              "bids": [["18891.9", "0.15688", "14103847"]]
+            },
+            "sequenceEnd": 14103847,
+            "sequenceStart": 14103844,
+            "symbol": "BTC-USDT",
+            "time": 1663747970273 //milliseconds
+        }
+         "Ask" (предложение о продаже) - это цена, по которой продавец готов
+         продать определенное количество акций или других ценных бумаг.
+
+         "Bid" (предложение о покупке) - это цена, по которой покупатель готов
+          купить определенное количество акций или других ценных бумаг.
+        """
+        self.stat_counter += 1
+        start_handle = time.perf_counter()
+
+        ticker = changes_data['symbol']
+        order_book = self.update_order_book_by_changes(
+            ticker,
+            changes_data['changes'],
+            changes_data['sequenceEnd']
+        )
+
+        self.logger.debug(
+            'symbol: %s, data: %s',
+            ticker, order_book
+        )
+        if order_book and order_book.is_relevant:
+            pair = self.tickers_to_pairs[ticker]
+            pair_info = self.pairs_info[pair]
+            pair_fee = self.pair_to_fee[pair]
+            min_funds = Decimal(pair_info.min_funds)
+            min_size = Decimal(pair_info.baseMinSize)
+
+            ask, bid = self.tune_to_size_n_funds_full(min_size, min_funds, order_book)
+            self.graph.update_graph_edge(pair, ask, fee=pair_fee)
+            self.graph.update_graph_edge(pair, bid, fee=pair_fee, inverted=True)
+            self.trigger_trade()
+
+        self.handle_sum += time.perf_counter() - start_handle
 
     async def clear_orders_buffers(self):
         now = time.time()
