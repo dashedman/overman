@@ -255,6 +255,12 @@ class Overman:
         self.display_body: tuple[str, tuple] | Callable[[], str] = ('', ())
         self.max_display = 0
 
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.session.close()
+
     @cached_property
     def session(self):
         return aiohttp.ClientSession(json_serialize=orjson.dumps)
@@ -1743,6 +1749,32 @@ class Overman:
         )
         return resp['orderId']
 
+    async def do_spot_request(
+            self,
+            method: Literal['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'HEAD', 'PATCH'],
+            endpoint: str,
+            data: Any = None,
+            params: dict[str, str] = None,
+            private: bool = False,
+    ):
+        api_url = 'https://api.kucoin.com'
+        return await self.do_request(
+            method, endpoint, data, params, private, api_url
+        )
+
+    async def do_fut_request(
+            self,
+            method: Literal['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'HEAD', 'PATCH'],
+            endpoint: str,
+            data: Any = None,
+            params: dict[str, str] = None,
+            private: bool = False,
+    ):
+        api_url = 'https://api-futures.kucoin.com'
+        return await self.do_request(
+            method, endpoint, data, params, private, api_url
+        )
+
     async def do_request(
             self,
             method: Literal['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'HEAD', 'PATCH'],
@@ -1750,6 +1782,7 @@ class Overman:
             data: Any = None,
             params: dict[str, str] = None,
             private: bool = False,
+            api_url = 'https://api.kucoin.com'
     ):
         if data is None:
             raw_data = b''
@@ -1762,8 +1795,7 @@ class Overman:
             raw_params = '?' + '&'.join(
                 f'{k}={v}' for k, v in params.items()
             )
-        url = 'https://api.kucoin.com' + endpoint
-        # url = 'https://openapi-sandbox.kucoin.com' + endpoint
+        url = api_url.rstrip('/') + '/' + endpoint.lstrip('/')
 
         for _ in range(3):
             if private:
