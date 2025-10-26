@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from functools import cached_property
-from typing import Literal, Any, NewType, Callable
+from typing import Literal, Any, Callable
 
 import aiohttp as aiohttp
 import orjson as orjson
@@ -30,11 +30,13 @@ BaseCoin = str
 QuoteCoin = str
 
 
-class PairInfo(BaseModel):
+class ApiModel(BaseModel):
     class Config:
         alias_generator = to_camel
         extra = 'forbid'
 
+
+class PairInfo(ApiModel):
     symbol: str
     base_currency: str
     quote_currency: str
@@ -66,6 +68,13 @@ class SpotPairInfo(PairInfo):
     callauction_second_stage_start_time: str
     callauction_third_stage_start_time: str
     trading_start_time: str
+
+
+class SymbolFee(ApiModel):
+    symbol: str
+    taker_fee_rate: Decimal
+    maker_fee_rate: Decimal
+    fee_tax_rate: Decimal
 
 
 
@@ -111,8 +120,8 @@ class Overman:
     tickers_to_pairs: dict[str, tuple[str, str]]
     pairs_to_tickers: dict[tuple[str, str], str]
     pairs_info: dict[tuple[str, str], PairInfo]
-    pair_to_fee: dict[tuple[str, str], Decimal]
-    done_orders: dict[str, Any]
+    pair_to_fee: dict[tuple[str, str], SymbolFee]
+    done_orders: dict[str, asyncio.Future[dict[str, Any]]]
     canceled_orders: dict[str, Any]
     init_market_cache: dict[str, list[tuple[dict, int]]]
 
@@ -135,8 +144,7 @@ class Overman:
         self.last_profit = -1
 
         self.current_balance: dict[str, Decimal] = {}
-        self.done_orders = {}
-        self.canceled_orders = {}
+        self.done_orders: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self.init_market_cache = defaultdict(list)
 
         self.status_bar = tqdm()
@@ -155,11 +163,11 @@ class Overman:
 
     @cached_property
     def logger(self):
-        return logger.setup_logger(self.__class__.__name__ + '_main', with_root=True)
+        return logger.setup_logger(self.__class__.__name__ + ':Main', with_root=True)
 
     @cached_property
     def result_logger(self):
-        return logger.setup_logger(self.__class__.__name__ + '_result')
+        return logger.setup_logger(self.__class__.__name__ + ':Result')
 
     @staticmethod
     def prepare_sub(subs_chunk: tuple[str]):
@@ -223,15 +231,18 @@ class Overman:
         async with self:
             await self.serve()
 
-    def run_sync(self):
+    def run_sync(self, debug: bool = False):
         try:
-            if sys.platform in ('win32', 'cygwin', 'cli'):
-                from winloop import run
+            if debug:
+                run = asyncio.run
             else:
-                # if we're on apple or linux do this instead
-                from uvloop import run
+                if sys.platform in ('win32', 'cygwin', 'cli'):
+                    from winloop import run
+                else:
+                    # if we're on apple or linux do this instead
+                    from uvloop import run
 
-            run(self.run(), debug=True)
+            run(self.run(), debug=debug)
             # asyncio.run(self.serve(), debug=True)
         except KeyboardInterrupt:
             self.logger.info('Ended by keyboard interrupt')
@@ -772,17 +783,14 @@ class Overman:
             'KC-API-PASSPHRASE': self.config.api_passphrase,
         }
 
-    async def get_order(self, order_id: str, ticker: str = ''):
-        params = {}
+    async def get_order(self, order_id: str):
         if self.hf_trade:
             endpoint = f'/api/v1/hf/orders/{order_id}'
-            params['symbol'] = ticker
         else:
             endpoint = f'/api/v1/orders/{order_id}'
         data = await self.do_request(
             'GET',
             endpoint,
-            params=params,
             private=True,
         )
         return data

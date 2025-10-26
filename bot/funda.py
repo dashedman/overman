@@ -1,13 +1,65 @@
 import asyncio
+import math
+import time
+from collections import deque
+from contextlib import asynccontextmanager
+from datetime import timedelta, datetime, UTC
 from decimal import Decimal
-from itertools import chain
-from typing import Any
+from enum import Enum
+from typing import Any, Literal, Callable, Awaitable
 
+import dateutil.tz
+import orjson
+import websockets
 from pydantic import Field
 from tqdm import tqdm
+from websockets.asyncio.client import ClientConnection
 
 from . import utils
-from .overman import Overman, PairInfo, BaseCoin, QuoteCoin
+from .exceptions import RequestException
+from .overman import Overman, PairInfo, BaseCoin, QuoteCoin, SymbolFee
+
+
+
+
+class TradeSide(Enum):
+    BUY = 'buy'
+    SELL = 'sell'
+
+
+class PositionSide(Enum):
+    LONG = 'LONG'
+    SHORT = 'SHORT'
+    BOTH = 'BOTH'
+
+    def trade_side_to_open(self):
+        match self:
+            case PositionSide.LONG:
+                return TradeSide.BUY
+            case PositionSide.SHORT:
+                return TradeSide.SELL
+            case _:
+                raise NotImplementedError('Undefined')
+
+    def trade_side_to_close(self):
+        match self:
+            case PositionSide.LONG:
+                return TradeSide.SELL
+            case PositionSide.SHORT:
+                return TradeSide.BUY
+            case _:
+                raise NotImplementedError('Undefined')
+
+
+class MarginMode(Enum):
+    ISOLATED = 'ISOLATED'
+    CROSS = 'CROSS'
+
+
+class OrderType(Enum):
+    LIMIT = 'limit'
+    MARKET = 'market'
+
 
 
 class FutPairInfo(PairInfo):
@@ -21,7 +73,7 @@ class FutPairInfo(PairInfo):
     market_max_order_qty: int
     max_price: float
     lot_size: int
-    tick_size: float
+    tick_size: Decimal
     index_price_tick_size: float
     multiplier: float
     initial_margin: float
@@ -85,9 +137,31 @@ class FutPairInfo(PairInfo):
     pre_market_to_perp_date: None
     funding_fee_rate: float | None
 
+    @property
+    def to_next_settlement(self):
+        return timedelta(milliseconds=self.next_funding_rate_time)
+
+    @property
+    def minimal_size(self):
+        return math.ceil(self.lot_size * self.multiplier)
 
 
 class Funda(Overman):
+    def __init__(self):
+        super().__init__()
+        self.funds_catcher_tasks = dict[str, asyncio.Task]()
+
+        self.positions_futures = dict[str, asyncio.Future[dict[str, Any]]]()
+
+        self.need_to_subscribe = deque[str]()
+        self.need_to_unsubscribe = deque[str]()
+
+        self.subscribed_topics = dict[tuple[str, bool], Callable[[Any], Awaitable[None]]]()
+        self.topic_router = dict[str, Callable[[Any], Awaitable[None]]]()
+
+        self.wait_socket = asyncio.Event()
+        self.current_sock: ClientConnection | None = None
+
     async def get_fut_symbols(self):
         symbols = await self.do_fut_request('GET', '/api/v1/contracts/active')
         return [FutPairInfo(**sym) for sym in symbols]
@@ -121,10 +195,10 @@ class Funda(Overman):
 
         self.logger.info('Loaded %s pairs', len(pairs_infos))
 
-    async def get_trade_fees(self, symbols: tuple[str]) -> list[dict[str, Any]]:
+    async def get_trade_fees(self, symbol: str) -> dict[str, Any]:
         return await self.do_fut_request(
             'GET', '/api/v1/trade-fees',
-            params={'symbols': ','.join(symbols)},
+            params={'symbol': symbol},
             private=True,
         )
 
@@ -132,30 +206,463 @@ class Funda(Overman):
         # loading fees
         # max 10 tickers per connection
         self.pair_to_fee = {}
-        ticker_chunks = utils.chunk(self.tickers_to_pairs.keys(), 150)
+        keys_iter = iter(self.tickers_to_pairs.keys())
+        first_ticker = next(keys_iter)
+        ticker_chunks = utils.chunk(keys_iter, 10)
 
         while True:
             self.logger.info('Trying to get first fees info.')
             try:
-                data = await self.get_trade_fees(ticker_chunks[0][:1])
-                if data:
+                data_unit = await self.get_trade_fees(first_ticker)
+                if data_unit:
+                    pair = self.tickers_to_pairs[data_unit['symbol']]
+                    self.pair_to_fee[pair] = SymbolFee(**data_unit)
                     break
             except Exception as e:
                 self.logger.warning(f'Catch {e}. Trying again. Sleep 60 sec')
             await asyncio.sleep(60)
 
-        for chunks in tqdm(ticker_chunks, postfix='fees loaded', ascii=True):
-            data_chunks = await asyncio.gather(*(
-                self.get_trade_fees(subchunk)
-                for subchunk in utils.chunk(chunks, 10)
+        for chunk in tqdm(ticker_chunks, postfix='fees loaded', ascii=True):
+            data = await asyncio.gather(*(
+                self.get_trade_fees(ticker)
+                for ticker in chunk
             ))
-            data = chain.from_iterable(data_chunks)
             for data_unit in data:
                 pair = self.tickers_to_pairs[data_unit['symbol']]
-                self.pair_to_fee[pair] = Decimal(data_unit['takerFeeRate'])
+                self.pair_to_fee[pair] = SymbolFee(**data_unit)
 
     async def serve(self):
+        await self.calibrate_server_time()
         await self.load_tickers()
         await self.load_fees()
+        await self.update_balance()
 
-        print()
+        async with asyncio.TaskGroup() as tg:
+            tg.create_task(self.funding_checker())
+            tg.create_task(self.listen_socket())
+
+    def tasks_in_process(self):
+        return not all(t.done() for t in self.funds_catcher_tasks.values())
+
+    async def funding_checker(self):
+        while True:
+            if not self.tasks_in_process():
+                await self.check_coming_funding()
+            await asyncio.sleep(5 * 60)
+
+    async def check_coming_funding(self):
+        coming_interval = timedelta(minutes=7)
+
+        symbols = await self.get_funding_fee_symbols(sort_best=True)
+        self.logger.info('Funding symbols: %s', len(symbols))
+
+        # temporary limitation
+        only_usdt = [sym for sym in symbols if sym.quote_currency == 'USDT']
+        self.logger.info('Only USDT symbols: %s', len(only_usdt))
+
+        profitable_funding = []
+        for symbol in only_usdt:
+            fee = self.pair_to_fee[self.tickers_to_pairs[symbol.symbol]]
+            position_lost_koef = 2 * fee.taker_fee_rate / (1 - fee.taker_fee_rate)
+            # print(symbol.symbol, fee.taker_fee_rate, fee.maker_fee_rate, position_lost_koef, symbol.funding_fee_rate)
+            if position_lost_koef >= abs(symbol.funding_fee_rate):
+                break
+            profitable_funding.append(symbol)
+        self.logger.info('Profitable symbols: %s', len(profitable_funding))
+
+        coming_funding = [sym for sym in profitable_funding if sym.to_next_settlement < coming_interval]
+        self.logger.info('Coming funding symbols: %s', len(coming_funding))
+        if not coming_funding:
+            nearest_symbol = min(profitable_funding, key=lambda sym: sym.to_next_settlement)
+            self.logger.info(
+                'Nearest funding %s in %s min(at %s UTC, %s in local)',
+                nearest_symbol.symbol,
+                nearest_symbol.to_next_settlement,
+                (datetime.now(UTC) + nearest_symbol.to_next_settlement).time(),
+                (datetime.now(dateutil.tz.tzlocal()) + nearest_symbol.to_next_settlement).time(),
+            )
+            return
+
+        self.logger.info('Top 5 fees: %s', [f'{s.funding_fee_rate * 100:.2f}%' for s in coming_funding[:5]])
+
+        ACTIVE_FUNDS_RATIO = 0.9
+        FUNDING_TASKS = 1
+        funds_for_task = float(self.current_balance['USDT']) * ACTIVE_FUNDS_RATIO / FUNDING_TASKS
+        could_be_processed = []
+        for sym in coming_funding:
+            # print(sym.symbol, sym.index_price * sym.minimal_size, funds_for_task)
+            if sym.index_price * sym.minimal_size < funds_for_task:
+                could_be_processed.append(sym)
+                break
+        self.logger.info('Could be processed symbols: %s', len(could_be_processed))
+        if not could_be_processed:
+            nearest_symbol = min(coming_funding, key=lambda sym: sym.index_price * sym.minimal_size)
+            self.logger.info(
+                'Nearest funding %s in %s, have: %s',
+                nearest_symbol.symbol,
+                nearest_symbol.index_price * nearest_symbol.minimal_size,
+                funds_for_task
+            )
+            return
+
+        to_process = could_be_processed[:FUNDING_TASKS]
+        for sym in to_process:
+            size_of_currency = float(funds_for_task) / sym.index_price
+            # lots_number = max(1, int(size_of_currency / sym.minimal_size))
+            lots_number = 1
+            self.start_funding_process(symbol=sym, lots_number=lots_number)
+
+    def start_funding_process(self, symbol: FutPairInfo, lots_number: int):
+        task = asyncio.create_task(self.process_funding(symbol, lots_number))
+        self.funds_catcher_tasks[symbol.symbol] = task
+        task.add_done_callback(lambda _: self.funds_catcher_tasks.pop(symbol.symbol))
+
+    async def process_funding(self, symbol: FutPairInfo, lots_number: int):
+        order_fut = asyncio.Future()
+        funding_fut = asyncio.Future()
+
+        try:
+            processing_logger = self.logger.getChild(f'Funding:{symbol.symbol}')
+            wait_to_minute = max(0.0, symbol.to_next_settlement.total_seconds() - 60)
+            if wait_to_minute:
+                processing_logger.info('Sleeping before start: %s sec', wait_to_minute)
+                await asyncio.sleep(wait_to_minute)
+
+            processing_logger.info('Starting for %.2f%%', symbol.funding_fee_rate * 100)
+
+            # create position, x1 to avoid liquidation
+            processing_logger.info('Creating position..')
+            side, opposite_side = (PositionSide.SHORT, PositionSide.LONG) if symbol.funding_fee_rate > 0 else (PositionSide.LONG, PositionSide.SHORT)
+            opened_order_id = await self.create_position(symbol=symbol.symbol, side=side, size=lots_number)
+
+            e = None
+            for _ in range(5):
+                try:
+                    opened_order = await self.get_order(opened_order_id)
+                except RequestException as e:
+                    if 'error.getOrder.orderNotExist' in str(e):
+                        continue
+                    raise e
+                break
+            else:
+                raise e
+
+
+            # create profitable limit order
+            need_profit = 0.05
+            profit_coefficient = 1 + (need_profit if side is PositionSide.LONG else -need_profit)
+            profit_price = (Decimal(opened_order['avgDealPrice']) * Decimal(profit_coefficient)).quantize(symbol.tick_size)
+            processing_logger.info(
+                'Creating profit limit order (profit: %.2f%%, price: %s)',
+                need_profit * 100, profit_price
+            )
+            profit_order_id = await self.close_position(symbol=symbol.symbol, price=profit_price, side=side)
+
+            self.done_orders[profit_order_id] = order_fut
+
+            async def apply_funding_fut(msg: dict[str, Any]):
+                processing_logger.info('Caught settlement announcement: %s', msg)
+                if msg['subject'] == 'funding.end':
+                    funding_fut.set_result(msg)
+
+            async with self.with_subscribe(
+                    f'/contract/announcement:{symbol.symbol}',
+                    True,
+                    apply_funding_fut
+            ):
+
+                # wait while fund will be settled or order closed by tp
+                processing_logger.info('Waiting for settle..')
+                await asyncio.wait((order_fut, funding_fut), timeout=10 * 60, return_when=asyncio.FIRST_COMPLETED)
+
+                if order_fut.done():
+                    # profit order done, do not wait for funds
+                    processing_logger.info('Profit order closed!')
+                    funding_fut.cancel()
+                    return
+
+                elif funding_fut.done():
+
+                    processing_logger.info('Funding fee settlement taken!')
+                else:
+                    self.logger.warning('Settlement timeout')
+
+                # cancel order if need
+                order_fut.cancel()
+                del self.done_orders[profit_order_id]
+                await self.cancel_order(profit_order_id)
+
+                # close position by market
+                await self.close_position(symbol=symbol.symbol, side=side)
+
+            # update balance
+            await self.update_balance(currency=symbol.base_currency)
+        finally:
+            order_fut.cancel()
+            funding_fut.cancel()
+
+    async def create_position(
+            self,
+            symbol: str,
+            size: int,
+            side: PositionSide
+    ) -> str:
+        # create order
+        data = await self.create_fut_order(
+            symbol=symbol,
+            size=size,
+            side=side,
+        )
+        return data['orderId']
+
+    async def close_position(
+            self,
+            symbol: str,
+            side: PositionSide,
+            price: Decimal | None = None
+    ):
+        close_type: Literal['immediate', 'limit'] = 'immediate' if price is None else 'limit'
+        order = await self.create_fut_order(symbol=symbol, side=side, close=close_type, price=price)
+        return order['orderId']
+
+    async def create_fut_order(
+            self,
+            symbol: str,
+            side: PositionSide,
+            size: int | None = None,
+            price: Decimal | None = None,
+            close: Literal['immediate', 'limit'] | None = None,
+    ) -> dict[str, str]:
+        endpoint = '/api/v1/orders'
+
+        request_data = {
+            'clientOid': str(self.next_uuid()),
+            'symbol': symbol,
+            'marginMode': MarginMode.ISOLATED.value,
+            'positionSide': side.value,
+        }
+        if close is not None:
+            # close current position
+            request_data['closeOrder'] = True
+            if close == 'immediate':
+                request_data['type'] = 'market'
+            elif close == 'limit':
+                assert price is not None
+                request_data['type'] = 'limit'
+                request_data['price'] = str(price)
+            else:
+                raise Exception(f'Undefined close case: {close}')
+        else:
+            # open new position
+            assert size is not None
+            assert side is not None
+
+            trade_side = side.trade_side_to_open()
+            request_data |= {
+                # opt
+                'side': trade_side.value,
+                'leverage': 1,
+                'type': 'market',
+                'size': size,
+            }
+
+        data = await self.do_fut_request(
+            'POST',
+            endpoint,
+            data=request_data,
+            private=True
+        )
+        return data
+
+    async def cancel_order(self, order_id: str):
+        endpoint = f'/api/v1/orders/{order_id}'
+        await self.do_fut_request(
+            'DELETE',
+            endpoint,
+            private=True
+        )
+
+    async def get_order(self, order_id: str):
+        endpoint = f'/api/v1/orders/{order_id}'
+        data = await self.do_fut_request(
+            'GET',
+            endpoint,
+            private=True,
+        )
+        return data
+
+    async def update_balance(self, currency: str | None = None):
+        if currency:
+            currencies = (currency,)
+        else:
+            currencies = tuple({quote for _, quote in self.pairs_info})
+
+        for currency in currencies:
+            account_info = await self.get_account_info(currency=currency)
+            self.current_balance[currency] = Decimal(account_info['availableBalance'])
+        self.logger.info(
+            'Current balance: %s',
+            ' '.join(
+                f'[{c}: {v:.4f}]'
+                for c, v in self.current_balance.items()
+                if v > 0
+            )
+        )
+
+    async def get_account_info(self, currency: str):
+        return await self.do_fut_request(
+            method='GET',
+            endpoint='/api/v1/account-overview',
+            params={'currency': currency},
+            private=True
+        )
+
+    async def switch_margin_mode(self, symbol: str, mode: Literal['ISOLATED', 'CROSS']):
+        print(await self.do_fut_request(
+            method='POST',
+            endpoint='/api/v2/position/changeMarginMode',
+            data={
+                'symbol': symbol,
+                'marginMode': mode,
+            },
+            private=True,
+        ))
+
+    @asynccontextmanager
+    async def with_subscribe(self, topic: str, is_private: bool, callback: Callable[[Any], Awaitable[None]]):
+        await self.subscribe_topic(topic, is_private, callback)
+        yield
+        await self.unsubscribe_topic(topic, is_private)
+
+    async def subscribe_topic(self, topic: str, is_private: bool, callback: Callable[[Any], Awaitable[None]]):
+        if topic in self.topic_router:
+            # already subscribed
+            return
+        await self.wait_socket.wait()
+        self.logger.info('Subscribe to %s', topic)
+        subscribe_msg = {
+            "topic": topic,
+            "privateChannel": is_private,
+            "id": self.next_ws_id(),
+            "type": "subscribe",
+            "response": True,
+        }
+        self.topic_router[topic] = callback
+        self.subscribed_topics[(topic, is_private)] = callback
+
+        subscribe_msg_raw = orjson.dumps(subscribe_msg).decode()
+        await self.current_sock.send(subscribe_msg_raw)
+
+    async def unsubscribe_topic(self, topic: str, is_private: bool):
+        await self.wait_socket.wait()
+
+        self.logger.info('Unsubscribe from %s', topic)
+        unsubscribe_msg = {
+            "topic": topic,
+            "privateChannel": is_private,
+            "id": self.next_ws_id(),
+            "type": "unsubscribe",
+            "response": True,
+        }
+        del self.topic_router[topic]
+        del self.subscribed_topics[(topic, is_private)]
+
+        unsubscribe_msg_raw = orjson.dumps(unsubscribe_msg).decode()
+        await self.current_sock.send(unsubscribe_msg_raw)
+
+    async def insure_subscribe_topics(self):
+        base_topics = [
+            ("/contractMarket/tradeOrders", True, self.process_order_msg),
+            ("/contractAccount/wallet", True, self.process_balance_msg),
+        ]
+        for base_topic, is_private, callback in base_topics:
+            key = (base_topic, is_private)
+            if key not in self.subscribed_topics:
+                self.subscribed_topics[key] = callback
+
+        for (topic, is_private), callback in self.subscribed_topics.items():
+            await self.subscribe_topic(topic, is_private, callback)
+
+    async def listen_socket(self):
+        url = f"wss://ws-api-futures.kucoin.com/?token={await self.private_token()}"
+        async for sock in websockets.connect(url, ping_interval=None):
+            self.current_sock = sock
+            self.topic_router.clear()
+            self.wait_socket.set()
+            try:
+                last_ping = time.time()
+
+                await self.insure_subscribe_topics()
+
+                while True:
+                    try:
+                        try:
+                            async with asyncio.timeout(self._private_ping_interval * 0.2):
+                                message_raw: str = await sock.recv()
+                        except TimeoutError:
+                            pass
+                        else:
+                            message: dict = orjson.loads(message_raw)
+                            if message.get('code') == 401:
+                                self.logger.info("Token has been expired")
+                                await self.reload_private_token()
+                                self.logger.info("Token reloaded")
+                            else:
+                                if 'data' in message:
+                                    asyncio.create_task(self.route_ws_message(message))
+                                else:
+                                    pass
+
+                        if last_ping + self._private_ping_interval * 0.8 < time.time():
+                            await sock.send(orjson.dumps({
+                                'id': str(self.next_ws_id()),
+                                'type': 'ping'
+                            }).decode())
+                            last_ping = time.time()
+                    except websockets.ConnectionClosed as e:
+                        self.logger.error('Catch error from websocket: %s', e)
+                        break
+                    except Exception as e:
+                        self.logger.error(
+                            'Catch error while monitoring socket:\n',
+                            exc_info=e)
+                        break
+            except websockets.ConnectionClosed as e:
+                self.logger.error('websocket error: %s', e)
+            finally:
+                self.current_sock = None
+                self.wait_socket = asyncio.Event()
+
+    async def route_ws_message(self, message: dict[str, Any]):
+        topic = message['topic']
+        callback = self.topic_router.get(topic)
+        if callback is None:
+            self.logger.warning('Cannot process topic: %s', topic)
+        else:
+            await callback(message)
+
+    async def process_order_msg(self, msg: dict[str, Any]):
+        order = msg['data']
+        order_id = order['orderId']
+        order_status = order['status']
+        match order_status:
+            case 'done':
+                if done_fut := self.done_orders.get(order_id):
+                    done_fut.set_result(order)
+                    del self.done_orders[order_id]
+            case _:
+                pass
+
+    async def process_balance_msg(self, msg):
+        self.logger.info('BALANCE MSG: %s', msg)
+
+    #
+    # async def process_position_msg(self, position):
+    #     symbol = position['symbol']
+    #     order_status = order['status']
+    #     match order_status:
+    #         case 'done':
+    #             if done_fut := self.done_orders.get(order_id):
+    #                 done_fut.set_result(order)
+    #         case _:
+    #             pass

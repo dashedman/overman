@@ -2,4 +2,4 @@ from bot.funda import Funda
 
 
 if __name__ == '__main__':
-    Funda().run_sync()
+    Funda().run_sync(debug=True)
