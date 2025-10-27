@@ -1,18 +1,20 @@
 import asyncio
 import math
 import time
-from collections import deque
+from collections import deque, defaultdict
 from contextlib import asynccontextmanager
 from datetime import timedelta, datetime, UTC
 from decimal import Decimal
 from enum import Enum
 from typing import Any, Literal, Callable, Awaitable
 
+import cachetools
 import dateutil.tz
 import orjson
 import websockets
 from pydantic import Field
 from tqdm import tqdm
+from typing_extensions import deprecated
 from websockets.asyncio.client import ClientConnection
 
 from . import utils
@@ -146,12 +148,17 @@ class FutPairInfo(PairInfo):
         return math.ceil(self.lot_size * self.multiplier)
 
 
+WebsocketMsg = dict[str, Any]
+
+
 class Funda(Overman):
+
     def __init__(self):
         super().__init__()
         self.funds_catcher_tasks = dict[str, asyncio.Task]()
 
-        self.positions_futures = dict[str, asyncio.Future[dict[str, Any]]]()
+        self.positions_futures = dict[str, asyncio.Future[WebsocketMsg]]()
+        self.balance_futures = defaultdict[str, list[asyncio.Future[WebsocketMsg]]](list)
 
         self.need_to_subscribe = deque[str]()
         self.need_to_unsubscribe = deque[str]()
@@ -161,6 +168,8 @@ class Funda(Overman):
 
         self.wait_socket = asyncio.Event()
         self.current_sock: ClientConnection | None = None
+
+        self.symbol_to_fee = cachetools.TTLCache[str, SymbolFee](maxsize=1000, ttl=60 * 60 * 10)
 
     async def get_fut_symbols(self):
         symbols = await self.do_fut_request('GET', '/api/v1/contracts/active')
@@ -202,10 +211,10 @@ class Funda(Overman):
             private=True,
         )
 
+    @deprecated('use lazy load get_fee_for_pair()')
     async def load_fees(self):
         # loading fees
         # max 10 tickers per connection
-        self.pair_to_fee = {}
         keys_iter = iter(self.tickers_to_pairs.keys())
         first_ticker = next(keys_iter)
         ticker_chunks = utils.chunk(keys_iter, 10)
@@ -231,10 +240,19 @@ class Funda(Overman):
                 pair = self.tickers_to_pairs[data_unit['symbol']]
                 self.pair_to_fee[pair] = SymbolFee(**data_unit)
 
+    async def get_fee_for_symbol(self, symbol: str):
+        if symbol in self.symbol_to_fee:
+            return self.symbol_to_fee[symbol]
+
+        fee_raw = await self.get_trade_fees(symbol=symbol)
+        fee = SymbolFee(**fee_raw)
+        self.symbol_to_fee[symbol] = fee
+        return fee
+
     async def serve(self):
         await self.calibrate_server_time()
         await self.load_tickers()
-        await self.load_fees()
+        # await self.load_fees()
         await self.update_balance()
 
         async with asyncio.TaskGroup() as tg:
@@ -262,7 +280,7 @@ class Funda(Overman):
 
         profitable_funding = []
         for symbol in only_usdt:
-            fee = self.pair_to_fee[self.tickers_to_pairs[symbol.symbol]]
+            fee = await self.get_fee_for_symbol(symbol.symbol)
             position_lost_koef = 2 * fee.taker_fee_rate / (1 - fee.taker_fee_rate)
             # print(symbol.symbol, fee.taker_fee_rate, fee.maker_fee_rate, position_lost_koef, symbol.funding_fee_rate)
             if position_lost_koef >= abs(symbol.funding_fee_rate):
@@ -286,14 +304,13 @@ class Funda(Overman):
         self.logger.info('Top 5 fees: %s', [f'{s.funding_fee_rate * 100:.2f}%' for s in coming_funding[:5]])
 
         ACTIVE_FUNDS_RATIO = 0.9
-        FUNDING_TASKS = 1
+        FUNDING_TASKS = min(3, len(coming_funding))
         funds_for_task = float(self.current_balance['USDT']) * ACTIVE_FUNDS_RATIO / FUNDING_TASKS
         could_be_processed = []
         for sym in coming_funding:
             # print(sym.symbol, sym.index_price * sym.minimal_size, funds_for_task)
             if sym.index_price * sym.minimal_size < funds_for_task:
                 could_be_processed.append(sym)
-                break
         self.logger.info('Could be processed symbols: %s', len(could_be_processed))
         if not could_be_processed:
             nearest_symbol = min(coming_funding, key=lambda sym: sym.index_price * sym.minimal_size)
@@ -308,8 +325,8 @@ class Funda(Overman):
         to_process = could_be_processed[:FUNDING_TASKS]
         for sym in to_process:
             size_of_currency = float(funds_for_task) / sym.index_price
-            # lots_number = max(1, int(size_of_currency / sym.minimal_size))
-            lots_number = 1
+            lots_number = max(1, int(size_of_currency / sym.minimal_size))
+            # lots_number = 1
             self.start_funding_process(symbol=sym, lots_number=lots_number)
 
     def start_funding_process(self, symbol: FutPairInfo, lots_number: int):
@@ -323,12 +340,18 @@ class Funda(Overman):
 
         try:
             processing_logger = self.logger.getChild(f'Funding:{symbol.symbol}')
-            wait_to_minute = max(0.0, symbol.to_next_settlement.total_seconds() - 60)
-            if wait_to_minute:
+            wait_to_minute = symbol.to_next_settlement.total_seconds() - 15
+            if wait_to_minute < 0:
+                processing_logger.warning('Too late funding: %s', symbol.to_next_settlement)
+                return
+            elif wait_to_minute > 0:
                 processing_logger.info('Sleeping before start: %s sec', wait_to_minute)
                 await asyncio.sleep(wait_to_minute)
 
-            processing_logger.info('Starting for %.2f%%', symbol.funding_fee_rate * 100)
+            processing_logger.info(
+                'Starting for %.2f%%, lots: %s',
+                symbol.funding_fee_rate * 100, lots_number
+            )
 
             # create position, x1 to avoid liquidation
             processing_logger.info('Creating position..')
@@ -347,7 +370,6 @@ class Funda(Overman):
             else:
                 raise e
 
-
             # create profitable limit order
             need_profit = 0.05
             profit_coefficient = 1 + (need_profit if side is PositionSide.LONG else -need_profit)
@@ -359,41 +381,31 @@ class Funda(Overman):
             profit_order_id = await self.close_position(symbol=symbol.symbol, price=profit_price, side=side)
 
             self.done_orders[profit_order_id] = order_fut
+            self.balance_futures[symbol.quote_currency].append(funding_fut)
 
-            async def apply_funding_fut(msg: dict[str, Any]):
-                processing_logger.info('Caught settlement announcement: %s', msg)
-                if msg['subject'] == 'funding.end':
-                    funding_fut.set_result(msg)
+            # wait while fund will be settled or order closed by tp
+            processing_logger.info('Waiting for settle..')
+            await asyncio.wait((order_fut, funding_fut), timeout=60, return_when=asyncio.FIRST_COMPLETED)
 
-            async with self.with_subscribe(
-                    f'/contract/announcement:{symbol.symbol}',
-                    True,
-                    apply_funding_fut
-            ):
+            if order_fut.done():
+                # profit order done, do not wait for funds
+                processing_logger.info('Profit order closed!')
+                funding_fut.cancel()
+                return
 
-                # wait while fund will be settled or order closed by tp
-                processing_logger.info('Waiting for settle..')
-                await asyncio.wait((order_fut, funding_fut), timeout=10 * 60, return_when=asyncio.FIRST_COMPLETED)
+            elif funding_fut.done():
 
-                if order_fut.done():
-                    # profit order done, do not wait for funds
-                    processing_logger.info('Profit order closed!')
-                    funding_fut.cancel()
-                    return
+                processing_logger.info('Funding fee settlement taken!')
+            else:
+                self.logger.warning('Settlement timeout')
 
-                elif funding_fut.done():
+            # cancel order if need
+            order_fut.cancel()
+            del self.done_orders[profit_order_id]
+            await self.cancel_order(profit_order_id)
 
-                    processing_logger.info('Funding fee settlement taken!')
-                else:
-                    self.logger.warning('Settlement timeout')
-
-                # cancel order if need
-                order_fut.cancel()
-                del self.done_orders[profit_order_id]
-                await self.cancel_order(profit_order_id)
-
-                # close position by market
-                await self.close_position(symbol=symbol.symbol, side=side)
+            # close position by market
+            await self.close_position(symbol=symbol.symbol, side=side)
 
             # update balance
             await self.update_balance(currency=symbol.base_currency)
@@ -654,7 +666,18 @@ class Funda(Overman):
                 pass
 
     async def process_balance_msg(self, msg):
-        self.logger.info('BALANCE MSG: %s', msg)
+        event_data = msg['data']
+        funding_fee = Decimal(event_data['isolatedFundingFeeMargin'])
+        currency = event_data['currency']
+        if funding_fee != 0:
+            self.logger.info('Caught funding balance change! %s: %s', currency, funding_fee)
+            futures = self.balance_futures[currency]
+            for fut in futures:
+                fut.set_result(msg)
+            futures.clear()
+        else:
+            self.logger.info('BALANCE MSG: %s', msg)
+
 
     #
     # async def process_position_msg(self, position):
