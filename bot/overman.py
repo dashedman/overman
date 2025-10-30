@@ -41,6 +41,9 @@ class PairInfo(ApiModel):
     base_currency: str
     quote_currency: str
 
+    def __hash__(self):
+        return hash(self.symbol)
+
 
 class SpotPairInfo(PairInfo):
     name: str
@@ -718,6 +721,7 @@ class Overman:
             )
         url = api_url.rstrip('/') + '/' + endpoint.lstrip('/')
 
+        big_err = None
         for _ in range(3):
             if private:
                 timestamp = int(time.time() * 1000) # + self.server_time_correction  # convert to milliseconds
@@ -737,29 +741,36 @@ class Overman:
                 data=raw_data,
                 headers=headers,
             )
-            async with request as resp:
-                if resp.status != 200:
-                    self.logger.error('Catch %s HTTP code while %s: %s',
-                                      resp.status, url, await resp.read())
-                    # raise Exception('bad request')
-                data_json = await resp.json(loads=orjson.loads)
-                resp_code = int(data_json['code'])
+            try:
+                async with request as resp:
+                    if resp.status != 200:
+                        self.logger.error('Catch %s HTTP code while %s: %s',
+                                          resp.status, url, await resp.read())
+                        # raise Exception('bad request')
+                    data_json = await resp.json(loads=orjson.loads)
+                    resp_code = int(data_json['code'])
 
-                if resp_code == 200000:
-                    return data_json['data']
-                if resp_code == 200004:
-                    raise BalanceInsufficientError(data_json['msg'])
-                if resp_code == 400002:
-                    continue
-                if resp_code == 400100:
-                    if 'Order size below the minimum requirement' in data_json['msg']:
-                        raise OrderSizeTooSmallError(data_json['msg'])
+                    if resp_code == 200000:
+                        return data_json['data']
+                    if resp_code == 200004:
+                        raise BalanceInsufficientError(data_json['msg'])
+                    if resp_code == 400002:
+                        continue
+                    if resp_code == 400100:
+                        if 'Order size below the minimum requirement' in data_json['msg']:
+                            raise OrderSizeTooSmallError(data_json['msg'])
 
-                self.logger.error(
-                    'Catch %s API code while %s: %s',
-                    data_json['code'], url, data_json['msg']
-                )
-                raise RequestException(data_json['msg'])
+                    self.logger.error(
+                        'Catch %s API code while %s: %s',
+                        data_json['code'], url, data_json['msg']
+                    )
+                    raise RequestException(data_json['msg'])
+            except aiohttp.client_exceptions.ClientConnectorDNSError as e:
+                big_err = e
+                self.logger.warning('caught dns error: %s', e)
+
+        if big_err:
+            raise big_err
         raise Exception(f'Cannot do request cause {data_json}')
 
     def signature(self, timestamp: int, method: str, endpoint: str, data: bytes):

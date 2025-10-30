@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from datetime import timedelta, datetime, UTC
 from decimal import Decimal
 from enum import Enum
-from typing import Any, Literal, Callable, Awaitable
+from typing import Any, Literal, Callable, Awaitable, Iterable
 
 import cachetools
 import dateutil.tz
@@ -151,6 +151,10 @@ class FutPairInfo(PairInfo):
 WebsocketMsg = dict[str, Any]
 
 
+def sort_by_profit(symbols: Iterable[FutPairInfo]) -> list[FutPairInfo]:
+    return sorted(symbols, key=lambda sym: abs(sym.funding_fee_rate), reverse=True)
+
+
 class Funda(Overman):
 
     def __init__(self):
@@ -170,6 +174,7 @@ class Funda(Overman):
         self.current_sock: ClientConnection | None = None
 
         self.symbol_to_fee = cachetools.TTLCache[str, SymbolFee](maxsize=1000, ttl=60 * 60 * 10)
+        self.get_fee_lock = defaultdict(asyncio.Lock)
 
     async def get_fut_symbols(self):
         symbols = await self.do_fut_request('GET', '/api/v1/contracts/active')
@@ -183,7 +188,7 @@ class Funda(Overman):
             if fs.funding_fee_rate is not None and fs.expire_date is None
         ]
         if sort_best:
-            return sorted(symbols, key=lambda sym: abs(sym.funding_fee_rate), reverse=True)
+            return sort_by_profit(symbols=symbols)
         return symbols
 
     async def load_tickers(self):
@@ -241,13 +246,20 @@ class Funda(Overman):
                 self.pair_to_fee[pair] = SymbolFee(**data_unit)
 
     async def get_fee_for_symbol(self, symbol: str):
-        if symbol in self.symbol_to_fee:
-            return self.symbol_to_fee[symbol]
+        async with self.get_fee_lock[symbol]:
+            if symbol in self.symbol_to_fee:
+                return self.symbol_to_fee[symbol]
 
-        fee_raw = await self.get_trade_fees(symbol=symbol)
-        fee = SymbolFee(**fee_raw)
-        self.symbol_to_fee[symbol] = fee
-        return fee
+            fee_raw = await self.get_trade_fees(symbol=symbol)
+            fee = SymbolFee(**fee_raw)
+            self.symbol_to_fee[symbol] = fee
+            return fee
+
+    async def get_funding_rate(self, symbol: str):
+        return await self.do_fut_request(
+            'GET',
+            f'/api/v1/funding-rate/{symbol}/current',
+        )
 
     async def serve(self):
         await self.calibrate_server_time()
@@ -266,63 +278,116 @@ class Funda(Overman):
         while True:
             if not self.tasks_in_process():
                 await self.check_coming_funding()
-            await asyncio.sleep(5 * 60)
+            await asyncio.sleep(3 * 60)
 
     async def check_coming_funding(self):
-        coming_interval = timedelta(minutes=7)
-
-        symbols = await self.get_funding_fee_symbols(sort_best=True)
+        symbols = await self.get_funding_fee_symbols()
         self.logger.info('Funding symbols: %s', len(symbols))
 
         # temporary limitation
-        only_usdt = [sym for sym in symbols if sym.quote_currency == 'USDT']
+        only_usdt = {sym for sym in symbols if sym.quote_currency == 'USDT'}
         self.logger.info('Only USDT symbols: %s', len(only_usdt))
 
-        profitable_funding = []
-        for symbol in only_usdt:
-            fee = await self.get_fee_for_symbol(symbol.symbol)
-            position_lost_koef = 2 * fee.taker_fee_rate / (1 - fee.taker_fee_rate)
+        not_usdt = {sym for sym in symbols if sym.quote_currency != 'USDT'}
+        another_currencies = {nu.quote_currency for nu in not_usdt}
+        self.logger.info('Another currencies: %s', another_currencies)
+        self.logger.info(
+            'Top 3 non-usdt profits: %s',
+            {
+                f'{s.funding_fee_rate * 100:.2f}': f'{s.quote_currency}/{s.base_currency}'
+                for s in sort_by_profit(not_usdt)[:3]
+            }
+        )
+
+        # semaphore = asyncio.Semaphore(50)
+        # async def fee_loader(symbol: FutPairInfo):
+        #     async with semaphore:
+        #         await self.get_fee_for_symbol(symbol.symbol)
+        #
+        # for sym in symbols:
+        #     asyncio.create_task(fee_loader(sym))
+
+        profitable_funding = set()
+        pos_lost_avg = 0
+        for symbol in symbols:
+            # fee = await self.get_fee_for_symbol(symbol.symbol)
+            position_lost_koef = 2 * symbol.taker_fee_rate / (1 - symbol.taker_fee_rate)
+            pos_lost_avg += position_lost_koef
             # print(symbol.symbol, fee.taker_fee_rate, fee.maker_fee_rate, position_lost_koef, symbol.funding_fee_rate)
-            if position_lost_koef >= abs(symbol.funding_fee_rate):
-                break
-            profitable_funding.append(symbol)
-        self.logger.info('Profitable symbols: %s', len(profitable_funding))
+            if position_lost_koef < abs(symbol.funding_fee_rate):
+                profitable_funding.add(symbol)
+        pos_lost_avg /= len(symbols)
+        self.logger.info(
+            'Profitable symbols (edge: %.2f) (%s): %s',
+            pos_lost_avg * 100,
+            len(profitable_funding),
+            {
+                f'{s.funding_fee_rate * 100}%': s.symbol
+                for s in sort_by_profit(profitable_funding)[:3]
+            }
+        )
 
-        coming_funding = [sym for sym in profitable_funding if sym.to_next_settlement < coming_interval]
-        self.logger.info('Coming funding symbols: %s', len(coming_funding))
-        if not coming_funding:
-            nearest_symbol = min(profitable_funding, key=lambda sym: sym.to_next_settlement)
-            self.logger.info(
-                'Nearest funding %s in %s min(at %s UTC, %s in local)',
-                nearest_symbol.symbol,
-                nearest_symbol.to_next_settlement,
-                (datetime.now(UTC) + nearest_symbol.to_next_settlement).time(),
-                (datetime.now(dateutil.tz.tzlocal()) + nearest_symbol.to_next_settlement).time(),
-            )
-            return
+        funding_by_time_window = defaultdict(set)
+        for sym in symbols:
+            minutes, secs = divmod(int(sym.to_next_settlement.total_seconds()), 60)
+            time_window = timedelta(minutes=minutes)
+            funding_by_time_window[time_window].add(sym)
+        funding_windows = sorted(funding_by_time_window)
+        self.logger.info('Funding windows: %s', ', '.join(str(w) for w in funding_windows))
 
-        self.logger.info('Top 5 fees: %s', [f'{s.funding_fee_rate * 100:.2f}%' for s in coming_funding[:5]])
+        nearest_window = funding_windows[0]
+        nearest_window_funding = funding_by_time_window[nearest_window]
+        self.logger.info(
+            'Nearest profits symbols (%s): %s',
+            len(nearest_window_funding),
+            {
+                f'{s.funding_fee_rate * 100}%': s.symbol
+                for s in sort_by_profit(nearest_window_funding)[:3]
+            }
+        )
 
         ACTIVE_FUNDS_RATIO = 0.9
-        FUNDING_TASKS = min(3, len(coming_funding))
+        FUNDING_TASKS = min(3, len(nearest_window_funding))
         funds_for_task = float(self.current_balance['USDT']) * ACTIVE_FUNDS_RATIO / FUNDING_TASKS
-        could_be_processed = []
-        for sym in coming_funding:
+
+        could_be_processed = set()
+        for sym in symbols:
             # print(sym.symbol, sym.index_price * sym.minimal_size, funds_for_task)
             if sym.index_price * sym.minimal_size < funds_for_task:
-                could_be_processed.append(sym)
+                could_be_processed.add(sym)
         self.logger.info('Could be processed symbols: %s', len(could_be_processed))
-        if not could_be_processed:
-            nearest_symbol = min(coming_funding, key=lambda sym: sym.index_price * sym.minimal_size)
+
+        profitable_in_window = nearest_window_funding & profitable_funding
+        self.logger.info('Profitable in window: %s', len(profitable_in_window))
+
+        all_in_one = sort_by_profit(profitable_in_window & only_usdt & could_be_processed)
+        self.logger.info('All in one: %s', len(all_in_one))
+
+        top_tasks = all_in_one[:FUNDING_TASKS]
+
+        for sym in top_tasks:
+            funding_info = await self.get_funding_rate(symbol=sym.symbol)
+            print(funding_info)
             self.logger.info(
-                'Nearest funding %s in %s, have: %s',
-                nearest_symbol.symbol,
-                nearest_symbol.index_price * nearest_symbol.minimal_size,
-                funds_for_task
+                '%s) common: %.2f, taken: %.2f, predicted: %.2f',
+                sym.symbol,
+                sym.funding_fee_rate * 100,
+                funding_info['value'] * 100,
+                funding_info.get('predictedValue', 0) * 100,
+            )
+
+        if nearest_window > timedelta(minutes=7):
+            self.logger.info(
+                'Nearest window will be in %s: %s',
+                nearest_window,
+                ', '.join(
+                    f'{s.funding_fee_rate * 100:.2f}%: {s.symbol}'
+                    for s in all_in_one[:FUNDING_TASKS]
+                ) or 'X'
             )
             return
 
-        to_process = could_be_processed[:FUNDING_TASKS]
+        to_process = all_in_one[:FUNDING_TASKS]
         for sym in to_process:
             size_of_currency = float(funds_for_task) / sym.index_price
             lots_number = max(1, int(size_of_currency / sym.minimal_size))
@@ -340,7 +405,7 @@ class Funda(Overman):
 
         try:
             processing_logger = self.logger.getChild(f'Funding:{symbol.symbol}')
-            wait_to_minute = symbol.to_next_settlement.total_seconds() - 15
+            wait_to_minute = symbol.to_next_settlement.total_seconds() - 25
             if wait_to_minute < 0:
                 processing_logger.warning('Too late funding: %s', symbol.to_next_settlement)
                 return
@@ -352,6 +417,8 @@ class Funda(Overman):
                 'Starting for %.2f%%, lots: %s',
                 symbol.funding_fee_rate * 100, lots_number
             )
+
+            await self.switch_margin_mode(symbol=symbol.symbol, mode='ISOLATED')
 
             # create position, x1 to avoid liquidation
             processing_logger.info('Creating position..')
@@ -371,7 +438,7 @@ class Funda(Overman):
                 raise e
 
             # create profitable limit order
-            need_profit = 0.05
+            need_profit = 0.01
             profit_coefficient = 1 + (need_profit if side is PositionSide.LONG else -need_profit)
             profit_price = (Decimal(opened_order['avgDealPrice']) * Decimal(profit_coefficient)).quantize(symbol.tick_size)
             processing_logger.info(
