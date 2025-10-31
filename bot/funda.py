@@ -176,9 +176,14 @@ class Funda(Overman):
         self.symbol_to_fee = cachetools.TTLCache[str, SymbolFee](maxsize=1000, ttl=60 * 60 * 10)
         self.get_fee_lock = defaultdict(asyncio.Lock)
 
-    async def get_fut_symbols(self):
-        symbols = await self.do_fut_request('GET', '/api/v1/contracts/active')
-        return [FutPairInfo(**sym) for sym in symbols]
+    async def get_fut_symbols(self, symbol: str | None = None):
+        if symbol is None:
+            symbols = await self.do_fut_request('GET', '/api/v1/contracts/active')
+            return [FutPairInfo(**sym) for sym in symbols]
+        else:
+            symbol = await self.do_fut_request('GET', f'/api/v1/contracts/{symbol}')
+            return FutPairInfo(**symbol)
+
 
     async def get_funding_fee_symbols(self, sort_best: bool = False):
         fut_symbols = await self.get_fut_symbols()
@@ -310,10 +315,9 @@ class Funda(Overman):
         profitable_funding = set()
         pos_lost_avg = 0
         for symbol in symbols:
-            # fee = await self.get_fee_for_symbol(symbol.symbol)
-            position_lost_koef = 2 * symbol.taker_fee_rate / (1 - symbol.taker_fee_rate)
+            position_lost_koef = 0.002 + 0 * 2 * symbol.taker_fee_rate / (1 - symbol.taker_fee_rate)
+            # position_lost_koef *= 0
             pos_lost_avg += position_lost_koef
-            # print(symbol.symbol, fee.taker_fee_rate, fee.maker_fee_rate, position_lost_koef, symbol.funding_fee_rate)
             if position_lost_koef < abs(symbol.funding_fee_rate):
                 profitable_funding.add(symbol)
         pos_lost_avg /= len(symbols)
@@ -363,19 +367,6 @@ class Funda(Overman):
         all_in_one = sort_by_profit(profitable_in_window & only_usdt & could_be_processed)
         self.logger.info('All in one: %s', len(all_in_one))
 
-        top_tasks = all_in_one[:FUNDING_TASKS]
-
-        for sym in top_tasks:
-            funding_info = await self.get_funding_rate(symbol=sym.symbol)
-            print(funding_info)
-            self.logger.info(
-                '%s) common: %.2f, taken: %.2f, predicted: %.2f',
-                sym.symbol,
-                sym.funding_fee_rate * 100,
-                funding_info['value'] * 100,
-                funding_info.get('predictedValue', 0) * 100,
-            )
-
         if nearest_window > timedelta(minutes=7):
             self.logger.info(
                 'Nearest window will be in %s: %s',
@@ -413,6 +404,45 @@ class Funda(Overman):
                 processing_logger.info('Sleeping before start: %s sec', wait_to_minute)
                 await asyncio.sleep(wait_to_minute)
 
+            # sym_info_list = []
+            # for _ in range(10):
+            #     request_start = time.time()
+            #     sym_info = await self.get_fut_symbols(symbol=symbol.symbol)
+            #     request_end = time.time()
+            #     request_mid = (request_start + request_end) / 2
+            #     sym_info_list.append((request_mid, sym_info))
+            #     await asyncio.sleep(4)
+            #
+            # first_index_price = None
+            # first_lt_price = None
+            # for rt, sym_info in sym_info_list:
+            #
+            #     if first_index_price is None:
+            #         first_index_price = sym_info.index_price
+            #         first_lt_price = sym_info.last_trade_price
+            #
+            #     processing_logger.info(
+            #         '%s) Funding rate %.3f%% in %s, diff: idx %.3f%%, lt %.3f%%',
+            #         datetime.fromtimestamp(timestamp=rt),
+            #         sym_info.funding_fee_rate * 100,
+            #         sym_info.to_next_settlement,
+            #         (sym_info.index_price / first_index_price - 1) * 100,
+            #         (sym_info.last_trade_price / first_lt_price - 1) * 100,
+            #     )
+            #
+            #     # processing_logger.info(
+            #     #     '%s) Funding rate %.3f%% in %s, index price: %s, mark price: %s, last trade price: %s, diff: idx %.3f%%, lt %.3f%%',
+            #     #     datetime.fromtimestamp(timestamp=rt),
+            #     #     sym_info.funding_fee_rate * 100,
+            #     #     sym_info.to_next_settlement,
+            #     #     sym_info.index_price,
+            #     #     sym_info.mark_price,
+            #     #     sym_info.last_trade_price,
+            #     #     (sym_info.index_price / first_index_price - 1) * 100,
+            #     #     (sym_info.last_trade_price / first_lt_price - 1) * 100,
+            #     # )
+            # return
+
             processing_logger.info(
                 'Starting for %.2f%%, lots: %s',
                 symbol.funding_fee_rate * 100, lots_number
@@ -438,16 +468,16 @@ class Funda(Overman):
                 raise e
 
             # create profitable limit order
-            need_profit = 0.01
-            profit_coefficient = 1 + (need_profit if side is PositionSide.LONG else -need_profit)
-            profit_price = (Decimal(opened_order['avgDealPrice']) * Decimal(profit_coefficient)).quantize(symbol.tick_size)
-            processing_logger.info(
-                'Creating profit limit order (profit: %.2f%%, price: %s)',
-                need_profit * 100, profit_price
-            )
-            profit_order_id = await self.close_position(symbol=symbol.symbol, price=profit_price, side=side)
-
-            self.done_orders[profit_order_id] = order_fut
+            # need_profit = 0.01
+            # profit_coefficient = 1 + (need_profit if side is PositionSide.LONG else -need_profit)
+            # profit_price = (Decimal(opened_order['avgDealPrice']) * Decimal(profit_coefficient)).quantize(symbol.tick_size)
+            # processing_logger.info(
+            #     'Creating profit limit order (profit: %.2f%%, price: %s)',
+            #     need_profit * 100, profit_price
+            # )
+            # profit_order_id = await self.close_position(symbol=symbol.symbol, price=profit_price, side=side)
+            #
+            # self.done_orders[profit_order_id] = order_fut
             self.balance_futures[symbol.quote_currency].append(funding_fut)
 
             # wait while fund will be settled or order closed by tp
