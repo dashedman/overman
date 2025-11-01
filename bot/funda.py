@@ -323,7 +323,7 @@ class Funda(Overman):
             pos_lost_avg * 100,
             len(profitable_funding),
             '\n'.join(
-                f'\t + {s.funding_fee_rate * 100}% {s.symbol} in {s.to_next_settlement}'
+                f'\t| {s.funding_fee_rate * 100}% {s.symbol} in {s.to_next_settlement}'
                 for s in sort_by_profit(profitable_funding)[:5]
             )
         )
