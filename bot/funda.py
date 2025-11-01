@@ -3,13 +3,12 @@ import math
 import time
 from collections import deque, defaultdict
 from contextlib import asynccontextmanager
-from datetime import timedelta, datetime, UTC
+from datetime import timedelta
 from decimal import Decimal
 from enum import Enum
 from typing import Any, Literal, Callable, Awaitable, Iterable
 
 import cachetools
-import dateutil.tz
 import orjson
 import websockets
 from pydantic import Field
@@ -20,8 +19,6 @@ from websockets.asyncio.client import ClientConnection
 from . import utils
 from .exceptions import RequestException
 from .overman import Overman, PairInfo, BaseCoin, QuoteCoin, SymbolFee
-
-
 
 
 class TradeSide(Enum):
@@ -315,7 +312,7 @@ class Funda(Overman):
         profitable_funding = set()
         pos_lost_avg = 0
         for symbol in symbols:
-            position_lost_koef = 0.002 + 0 * 2 * symbol.taker_fee_rate / (1 - symbol.taker_fee_rate)
+            position_lost_koef = 0.0025 + 0 * 2 * symbol.taker_fee_rate / (1 - symbol.taker_fee_rate)
             # position_lost_koef *= 0
             pos_lost_avg += position_lost_koef
             if position_lost_koef < abs(symbol.funding_fee_rate):
@@ -396,7 +393,9 @@ class Funda(Overman):
 
         try:
             processing_logger = self.logger.getChild(f'Funding:{symbol.symbol}')
-            wait_to_minute = symbol.to_next_settlement.total_seconds() - 25
+
+            await self.switch_margin_mode(symbol=symbol.symbol, mode='ISOLATED')
+            wait_to_minute = symbol.to_next_settlement.total_seconds() - 10
             if wait_to_minute < 0:
                 processing_logger.warning('Too late funding: %s', symbol.to_next_settlement)
                 return
@@ -448,8 +447,6 @@ class Funda(Overman):
                 symbol.funding_fee_rate * 100, lots_number
             )
 
-            await self.switch_margin_mode(symbol=symbol.symbol, mode='ISOLATED')
-
             # create position, x1 to avoid liquidation
             processing_logger.info('Creating position..')
             side, opposite_side = (PositionSide.SHORT, PositionSide.LONG) if symbol.funding_fee_rate > 0 else (PositionSide.LONG, PositionSide.SHORT)
@@ -498,8 +495,8 @@ class Funda(Overman):
 
             # cancel order if need
             order_fut.cancel()
-            del self.done_orders[profit_order_id]
-            await self.cancel_order(profit_order_id)
+            # del self.done_orders[profit_order_id]
+            # await self.cancel_order(profit_order_id)
 
             # close position by market
             await self.close_position(symbol=symbol.symbol, side=side)

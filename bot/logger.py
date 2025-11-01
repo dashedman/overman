@@ -57,5 +57,6 @@ def setup_logger(logger_name, logger_level=logging.INFO, with_root: bool = False
         fmt=FORMATTER_STR,
         level_styles=level_colormap,
         field_styles=field_colormap,
+        isatty=True,
     )
     return logging.getLogger(logger_name)
