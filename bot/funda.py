@@ -319,13 +319,13 @@ class Funda(Overman):
                 profitable_funding.add(symbol)
         pos_lost_avg /= len(symbols)
         self.logger.info(
-            'Profitable symbols (edge: %.2f) (%s): %s',
+            'Profitable symbols (edge: %.2f) (%s): \n%s',
             pos_lost_avg * 100,
             len(profitable_funding),
-            {
-                f'{s.funding_fee_rate * 100}%': s.symbol
-                for s in sort_by_profit(profitable_funding)[:3]
-            }
+            '\n'.join(
+                f'\t + {s.funding_fee_rate * 100}% {s.symbol} in {s.to_next_settlement}'
+                for s in sort_by_profit(profitable_funding)[:5]
+            )
         )
 
         funding_by_time_window = defaultdict(set)
