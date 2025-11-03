@@ -632,7 +632,8 @@ class Funda(Overman):
         self.opened_orders[symbol] = open_fut
         try:
             yield open_fut
-            await open_fut
+            async with asyncio.timeout(60):
+                await open_fut
         finally:
             if open_fut is self.opened_orders.get(symbol):
                 del self.opened_orders[symbol]
