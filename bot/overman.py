@@ -146,7 +146,8 @@ class Overman:
 
         self.last_profit = -1
 
-        self.current_balance: dict[str, Decimal] = {}
+        self.current_spot_balance: dict[str, Decimal] = {}
+        self.current_futures_balance: dict[str, Decimal] = {}
         self.done_orders: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self.init_market_cache = defaultdict(list)
 

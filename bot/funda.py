@@ -172,6 +172,7 @@ class Funda(Overman):
 
         self.symbol_to_fee = cachetools.TTLCache[str, SymbolFee](maxsize=1000, ttl=60 * 60 * 10)
         self.get_fee_lock = defaultdict(asyncio.Lock)
+        self.get_currency_lock = defaultdict(asyncio.Lock)
 
     async def get_fut_symbols(self, symbol: str | None = None):
         if symbol is None:
@@ -180,7 +181,6 @@ class Funda(Overman):
         else:
             symbol = await self.do_fut_request('GET', f'/api/v1/contracts/{symbol}')
             return FutPairInfo(**symbol)
-
 
     async def get_funding_fee_symbols(self, sort_best: bool = False):
         fut_symbols = await self.get_fut_symbols()
@@ -267,7 +267,8 @@ class Funda(Overman):
         await self.calibrate_server_time()
         await self.load_tickers()
         # await self.load_fees()
-        await self.update_balance()
+        await self.update_fut_balance()
+        await self.update_spot_balance()
 
         async with asyncio.TaskGroup() as tg:
             tg.create_task(self.funding_checker())
@@ -287,11 +288,11 @@ class Funda(Overman):
         self.logger.info('Funding symbols: %s', len(symbols))
 
         # temporary limitation
-        only_usdt = {sym for sym in symbols if sym.quote_currency == 'USDT'}
+        only_usdt = {sym for sym in symbols if sym.settle_currency == 'USDT'}
         self.logger.info('Only USDT symbols: %s', len(only_usdt))
 
-        not_usdt = {sym for sym in symbols if sym.quote_currency != 'USDT'}
-        another_currencies = {nu.quote_currency for nu in not_usdt}
+        not_usdt = {sym for sym in symbols if sym.settle_currency != 'USDT'}
+        another_currencies = {nu.settle_currency for nu in not_usdt}
         self.logger.info('Another currencies: %s', another_currencies)
         self.logger.info(
             'Top 3 non-usdt profits: %s',
@@ -347,52 +348,79 @@ class Funda(Overman):
             }
         )
 
-        ACTIVE_FUNDS_RATIO = 0.9
-        FUNDING_TASKS = min(3, len(nearest_window_funding))
-        funds_for_task = float(self.current_balance['USDT']) * ACTIVE_FUNDS_RATIO / FUNDING_TASKS
-
-        could_be_processed = set()
-        for sym in symbols:
-            # print(sym.symbol, sym.index_price * sym.minimal_size, funds_for_task)
-            if sym.index_price * sym.minimal_size < funds_for_task:
-                could_be_processed.add(sym)
-        self.logger.info('Could be processed symbols: %s', len(could_be_processed))
-
         profitable_in_window = nearest_window_funding & profitable_funding
         self.logger.info('Profitable in window: %s', len(profitable_in_window))
 
-        all_in_one = sort_by_profit(profitable_in_window & only_usdt & could_be_processed)
-        self.logger.info('All in one: %s', len(all_in_one))
+        ACTIVE_FUNDS_RATIO = 0.9
 
-        if nearest_window > timedelta(minutes=7):
-            self.logger.info(
-                'Nearest window will be in %s: %s',
-                nearest_window,
-                ', '.join(
-                    f'{s.funding_fee_rate * 100:.2f}%: {s.symbol}'
-                    for s in all_in_one[:FUNDING_TASKS]
-                ) or 'X'
-            )
-            return
+        grouped_by_currency = defaultdict(set)
+        for sym in profitable_in_window:
+            grouped_by_currency[sym.settle_currency].add(sym)
 
-        to_process = all_in_one[:FUNDING_TASKS]
-        for sym in to_process:
-            size_of_currency = float(funds_for_task) / sym.index_price
-            lots_number = max(1, int(size_of_currency / sym.minimal_size))
-            # lots_number = 1
-            self.start_funding_process(symbol=sym, lots_number=lots_number)
+        could_be_processed = set()
+        for currency, funding_group in grouped_by_currency.items():
+            FUNDING_TASKS = min(3, len(funding_group))
+            funds_for_task = float(
+                self.current_futures_balance.get(currency, 0)
+            ) * ACTIVE_FUNDS_RATIO / FUNDING_TASKS
+
+            for sym in funding_group:
+                # print(sym.symbol, sym.index_price * sym.minimal_size, funds_for_task)
+                need_funds = sym.index_price * sym.minimal_size
+                if need_funds < funds_for_task:
+                    could_be_processed.add(sym)
+                else:
+                    self.logger.warning(
+                        'Not enough funds of currency %s! (need %s, have: %s)',
+                        currency, need_funds, funds_for_task
+                    )
+            self.logger.info('Could be processed symbols: %s', len(could_be_processed))
+
+            all_in_one = sort_by_profit(could_be_processed)
+            self.logger.info('All in one: %s', len(all_in_one))
+
+            if nearest_window > timedelta(minutes=7):
+                self.logger.info(
+                    'Nearest window will be in %s: %s',
+                    nearest_window,
+                    ', '.join(
+                        f'{s.funding_fee_rate * 100:.2f}%: {s.symbol}'
+                        for s in all_in_one[:FUNDING_TASKS]
+                    ) or 'X'
+                )
+                return
+
+            tasks = []
+            to_process = all_in_one[:FUNDING_TASKS]
+            for sym in to_process:
+                size_of_currency = float(funds_for_task) / sym.index_price
+                lots_number = max(1, int(size_of_currency / sym.minimal_size))
+                # lots_number = 1
+                task = self.start_funding_process(symbol=sym, lots_number=lots_number)
+                tasks.append(task)
+
+            if tasks:
+                result = await asyncio.gather(*tasks, return_exceptions=True)
+
+                for idx, res in enumerate(result):
+                    if isinstance(res, BaseException):
+                        self.logger.error('Caught for %s: ', to_process[idx].symbol, exc_info=res)
+                await self.update_fut_balance()
+                await self.update_spot_balance()
 
     def start_funding_process(self, symbol: FutPairInfo, lots_number: int):
         task = asyncio.create_task(self.process_funding(symbol, lots_number))
         self.funds_catcher_tasks[symbol.symbol] = task
         task.add_done_callback(lambda _: self.funds_catcher_tasks.pop(symbol.symbol))
+        return task
 
     async def process_funding(self, symbol: FutPairInfo, lots_number: int):
         order_fut = asyncio.Future()
         funding_fut = asyncio.Future()
 
         try:
-            processing_logger = self.logger.getChild(f'Funding:{symbol.symbol}')
+            is_short = symbol.funding_fee_rate > 0
+            processing_logger = self.logger.getChild(f'Funding:{symbol.symbol}:{'SH' if is_short else 'LG'}')
 
             await self.switch_margin_mode(symbol=symbol.symbol, mode='ISOLATED')
             wait_to_minute = symbol.to_next_settlement.total_seconds() - 10
@@ -475,7 +503,7 @@ class Funda(Overman):
             # profit_order_id = await self.close_position(symbol=symbol.symbol, price=profit_price, side=side)
             #
             # self.done_orders[profit_order_id] = order_fut
-            self.balance_futures[symbol.quote_currency].append(funding_fut)
+            self.balance_futures[symbol.settle_currency].append(funding_fut)
 
             # wait while fund will be settled or order closed by tp
             processing_logger.info('Waiting for settle..')
@@ -500,9 +528,6 @@ class Funda(Overman):
 
             # close position by market
             await self.close_position(symbol=symbol.symbol, side=side)
-
-            # update balance
-            await self.update_balance(currency=symbol.base_currency)
         finally:
             order_fut.cancel()
             funding_fut.cancel()
@@ -541,7 +566,7 @@ class Funda(Overman):
     ) -> dict[str, str]:
         endpoint = '/api/v1/orders'
 
-        request_data = {
+        request_data: dict[str, Any] = {
             'clientOid': str(self.next_uuid()),
             'symbol': symbol,
             'marginMode': MarginMode.ISOLATED.value,
@@ -597,23 +622,51 @@ class Funda(Overman):
         )
         return data
 
-    async def update_balance(self, currency: str | None = None):
-        if currency:
-            currencies = (currency,)
-        else:
-            currencies = tuple({quote for _, quote in self.pairs_info})
+    async def update_fut_balance(self, currency: str | None = None):
+        lock = self.get_currency_lock[('FUT', currency)]
+        if lock.locked():
+            return
 
-        for currency in currencies:
-            account_info = await self.get_account_info(currency=currency)
-            self.current_balance[currency] = Decimal(account_info['availableBalance'])
-        self.logger.info(
-            'Current balance: %s',
-            ' '.join(
-                f'[{c}: {v:.4f}]'
-                for c, v in self.current_balance.items()
-                if v > 0
+        async with lock:
+            if currency:
+                currencies = (currency,)
+            else:
+                currencies = tuple({quote for _, quote in self.pairs_info})
+
+            for currency in currencies:
+                account_info = await self.get_account_info(currency=currency)
+                self.current_futures_balance[currency] = Decimal(account_info['availableBalance'])
+            self.logger.info(
+                'Current FUTURES balance: %s',
+                ' '.join(
+                    f'[{c}: {v:.4f}]'
+                    for c, v in self.current_futures_balance.items()
+                    if v > 0
+                )
             )
-        )
+
+    async def update_spot_balance(self):
+        lock = self.get_currency_lock['SPOT']
+        if lock.locked():
+            return
+
+        async with lock:
+            # AccountType = Literal['main', 'trade', 'trade_hf']
+            accounts_info = await self.get_accounts_list()
+            # need_type = 'trade_hf' if self.hf_trade else 'trade'
+            for acc_info in accounts_info:
+                if acc_info['type'] != 'trade_hf':
+                    continue
+
+                self.current_spot_balance[acc_info['currency']] = Decimal(acc_info['available'])
+            self.logger.info(
+                'Current SPOT HF balance: %s',
+                ' '.join(
+                    f'[{c}: {v:.4f}]'
+                    for c, v in self.current_spot_balance.items()
+                    if v > 0
+                )
+            )
 
     async def get_account_info(self, currency: str):
         return await self.do_fut_request(
