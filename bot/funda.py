@@ -135,6 +135,7 @@ class FutPairInfo(PairInfo):
     market_stage: str
     pre_market_to_perp_date: None
     funding_fee_rate: float | None
+    pre_market_to_perp_date: int | None
 
     @property
     def to_next_settlement(self):
