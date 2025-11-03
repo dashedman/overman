@@ -482,6 +482,7 @@ class Funda(Overman):
 
             async with self.wait_order_opened(symbol.symbol):
                 opened_order_id = await self.create_position(symbol=symbol.symbol, side=side, size=lots_number)
+            processing_logger.info('Created!')
             # opened_order = await self.get_order(opened_order_id)
             # e = None
             # for _ in range(5):
