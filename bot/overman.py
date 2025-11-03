@@ -149,6 +149,7 @@ class Overman:
         self.current_spot_balance: dict[str, Decimal] = {}
         self.current_futures_balance: dict[str, Decimal] = {}
         self.done_orders: dict[str, asyncio.Future[dict[str, Any]]] = {}
+        self.opened_orders: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self.init_market_cache = defaultdict(list)
 
         self.status_bar = tqdm()

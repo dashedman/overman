@@ -479,19 +479,21 @@ class Funda(Overman):
             # create position, x1 to avoid liquidation
             processing_logger.info('Creating position..')
             side, opposite_side = (PositionSide.SHORT, PositionSide.LONG) if symbol.funding_fee_rate > 0 else (PositionSide.LONG, PositionSide.SHORT)
-            opened_order_id = await self.create_position(symbol=symbol.symbol, side=side, size=lots_number)
 
-            e = None
-            for _ in range(5):
-                try:
-                    opened_order = await self.get_order(opened_order_id)
-                except RequestException as e:
-                    if 'error.getOrder.orderNotExist' in str(e):
-                        continue
-                    raise e
-                break
-            else:
-                raise e
+            async with self.wait_order_opened(symbol.symbol):
+                opened_order_id = await self.create_position(symbol=symbol.symbol, side=side, size=lots_number)
+            # opened_order = await self.get_order(opened_order_id)
+            # e = None
+            # for _ in range(5):
+            #     try:
+            #         opened_order = await self.get_order(opened_order_id)
+            #     except RequestException as e:
+            #         if 'error.getOrder.orderNotExist' in str(e):
+            #             continue
+            #         raise e
+            #     break
+            # else:
+            #     raise e
 
             # create profitable limit order
             # need_profit = 0.01
@@ -622,6 +624,17 @@ class Funda(Overman):
             private=True,
         )
         return data
+
+    @asynccontextmanager
+    async def wait_order_opened(self, symbol: str):
+        open_fut = asyncio.Future()
+        self.opened_orders[symbol] = open_fut
+        try:
+            yield open_fut
+            await open_fut
+        finally:
+            if open_fut is self.opened_orders.get(symbol):
+                del self.opened_orders[symbol]
 
     async def update_fut_balance(self, currency: str | None = None):
         lock = self.get_currency_lock[('FUT', currency)]
@@ -804,14 +817,21 @@ class Funda(Overman):
     async def process_order_msg(self, msg: dict[str, Any]):
         order = msg['data']
         order_id = order['orderId']
+        order_symbol = order['symbol']
         order_status = order['status']
         match order_status:
             case 'done':
                 if done_fut := self.done_orders.get(order_id):
                     done_fut.set_result(order)
                     del self.done_orders[order_id]
-            case _:
+            case 'open':
+                if open_fut := self.opened_orders.get(order_symbol):
+                    open_fut.set_result(order)
+                    del self.opened_orders[order_symbol]
+            case 'match':
                 pass
+            case _:
+                self.logger.warning('Undefined order status: %s', order_status)
 
     async def process_balance_msg(self, msg):
         event_data = msg['data']
