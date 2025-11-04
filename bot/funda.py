@@ -479,8 +479,8 @@ class Funda(Overman):
             processing_logger.info('Creating position..')
             side, opposite_side = (PositionSide.SHORT, PositionSide.LONG) if symbol.funding_fee_rate > 0 else (PositionSide.LONG, PositionSide.SHORT)
 
-            async with self.wait_order_opened(symbol.symbol):
-                opened_order_id = await self.create_position(symbol=symbol.symbol, side=side, size=lots_number)
+            # async with self.wait_order_opened(symbol.symbol):
+            opened_order_id = await self.create_position(symbol=symbol.symbol, side=side, size=lots_number)
             processing_logger.info('Created!')
             # opened_order = await self.get_order(opened_order_id)
             # e = None
