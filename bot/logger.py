@@ -37,7 +37,7 @@ FORMATTER_STR = '[%(asctime)s|%(name)s|%(levelname)7s] %(message)s'
 def setup_logger(logger_name, logger_level=logging.INFO, with_root: bool = False):
     setup_logger = logging.getLogger(None if with_root else logger_name)
 
-    log_dir = '../logs'
+    log_dir = './logs'
     if not os.path.exists(log_dir):
         os.mkdir(log_dir)
     log_file = os.path.join(log_dir, f'{logger_name}.log')

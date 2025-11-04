@@ -1,7 +1,7 @@
 import asyncio
 import math
 import time
-from collections import deque, defaultdict
+from collections import deque, defaultdict, Counter
 from contextlib import asynccontextmanager
 from datetime import timedelta
 from decimal import Decimal
@@ -374,6 +374,11 @@ class Funda(Overman):
                         'Not enough funds of currency %s! (need %s, have: %s)',
                         currency, need_funds, funds_for_task
                     )
+                    if currency != 'USDT':
+                        self.result_logger.warning(
+                            'Not enough funds of currency %s! (need %s, have: %s)',
+                            currency, need_funds, funds_for_task,
+                        )
             self.logger.info('Could be processed symbols: %s', len(could_be_processed))
 
             all_in_one = sort_by_profit(could_be_processed)
@@ -400,6 +405,7 @@ class Funda(Overman):
                 tasks.append(task)
 
             if tasks:
+                old_balance = self.current_futures_balance.copy()
                 result = await asyncio.gather(*tasks, return_exceptions=True)
 
                 for idx, res in enumerate(result):
@@ -407,6 +413,23 @@ class Funda(Overman):
                         self.logger.error('Caught for %s: ', to_process[idx].symbol, exc_info=res)
                 await self.update_fut_balance()
                 await self.update_spot_balance()
+
+                # print balance diff
+                curr_keys = set(self.current_futures_balance) | set(old_balance)
+                balance_diff = {
+                    curr: (
+                        self.current_futures_balance.get(curr, 0),
+                        self.current_futures_balance.get(curr, 0) - old_balance.get(curr, 0),
+                    )
+                    for curr in curr_keys
+                    if self.current_futures_balance.get(curr, 0) > 0 and
+                       self.current_futures_balance.get(curr, 0) - old_balance.get(curr, 0) != 0
+                }
+                self.result_logger.info('%s', ', '.join(
+                    f'{curr}: {balance:.3f} ({diff:.3f})'
+                    for curr, (balance, diff) in sorted(balance_diff.items(), key=lambda kv: abs(kv[1][1]))
+                ))
+
 
     def start_funding_process(self, symbol: FutPairInfo, lots_number: int):
         task = asyncio.create_task(self.process_funding(symbol, lots_number))
