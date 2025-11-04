@@ -84,7 +84,7 @@ class FutPairInfo(PairInfo):
     taker_fee_rate: float
     taker_fix_fee: float
     maker_fix_fee: float
-    settlement_fee: None
+    settlement_fee: float | None
     is_deleverage: bool
     is_quanto: bool
     is_inverse: bool
@@ -133,7 +133,6 @@ class FutPairInfo(PairInfo):
     adjust_active_time: int | None
     cross_risk_limit: float
     market_stage: str
-    pre_market_to_perp_date: None
     funding_fee_rate: float | None
     pre_market_to_perp_date: int | None
 

@@ -2,6 +2,7 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import logging
 import sys
 import time
 import uuid
@@ -11,11 +12,12 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from functools import cached_property
-from typing import Literal, Any, Callable
+from typing import Literal, Any, Callable, Self
 
 import aiohttp as aiohttp
+import cachetools
 import orjson as orjson
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 from pydantic.alias_generators import to_camel
 from sortedcontainers import SortedDict
 from tqdm import tqdm
@@ -30,10 +32,23 @@ BaseCoin = str
 QuoteCoin = str
 
 
+extra_models_warnings = cachetools.TTLCache(maxsize=100, ttl=60 * 5)
+
+
 class ApiModel(BaseModel):
     class Config:
         alias_generator = to_camel
-        extra = 'forbid'
+        extra = 'allow'
+
+    @model_validator(mode='after')
+    def extra_field_warn(self) -> Self:
+        if self.__pydantic_extra__ and self.__class__ not in extra_models_warnings:
+            logging.getLogger('ModelValidator').warning(
+                'Model %s has extra fields from JSON!',
+                self.__class__.__name__,
+            )
+            extra_models_warnings[self.__class__] = True
+        return self
 
 
 class PairInfo(ApiModel):
