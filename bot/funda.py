@@ -536,6 +536,7 @@ class Funda(Overman):
             if funding_fut.done():
                 processing_logger.info('Funding fee settlement taken!')
             else:
+                funding_fut.cancel()
                 self.logger.warning('Settlement timeout')
 
             # close position by market
@@ -902,12 +903,12 @@ class Funda(Overman):
     #         self.logger.info('BALANCE MSG: %s', msg)
 
     async def process_position_msg(self, msg):
-        self.logger.info('ppm: %s', msg)
         position = msg['data']
         subject = msg['subject']
         symbol = position['symbol']
         match subject:
             case 'position.settlement':
+                self.logger.info('stt old: %s', symbol)
                 if fee_fut := self.positions_settle_futures.get(symbol):
                     fee_fut.set_result(position)
             case 'position.change':
@@ -921,7 +922,12 @@ class Funda(Overman):
         symbol = position['symbol']
 
         match change_reason:
+            case 'fundingSettle':
+                self.logger.info('stt: %s', symbol)
+                if fee_fut := self.positions_settle_futures.get(symbol):
+                    fee_fut.set_result(position)
             case 'positionChange':
+                self.logger.info('pc: %s open: %s', symbol, is_open)
                 if not is_open:
                     if closed_fut := self.positions_closed_futures.get(symbol):
                         closed_fut.set_result(position)
