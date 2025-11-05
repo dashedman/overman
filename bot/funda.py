@@ -902,6 +902,7 @@ class Funda(Overman):
     #         self.logger.info('BALANCE MSG: %s', msg)
 
     async def process_position_msg(self, msg):
+        self.logger.info('ppm: %s', msg)
         position = msg['data']
         subject = msg['subject']
         symbol = position['symbol']
