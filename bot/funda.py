@@ -910,6 +910,7 @@ class Funda(Overman):
             case 'position.settlement':
                 self.logger.info('stt old: %s', symbol)
                 if fee_fut := self.positions_settle_futures.get(symbol):
+                    self.logger.info('stt old hit!')
                     fee_fut.set_result(position)
             case 'position.change':
                 await self.process_position_change(position)
@@ -925,9 +926,11 @@ class Funda(Overman):
             case 'fundingSettle':
                 self.logger.info('stt: %s', symbol)
                 if fee_fut := self.positions_settle_futures.get(symbol):
+                    self.logger.info('stt hit!')
                     fee_fut.set_result(position)
             case 'positionChange':
                 self.logger.info('pc: %s open: %s', symbol, is_open)
                 if not is_open:
                     if closed_fut := self.positions_closed_futures.get(symbol):
+                        self.logger.info('pc closed hit!')
                         closed_fut.set_result(position)
