@@ -165,6 +165,7 @@ class Overman:
         self.current_futures_balance: dict[str, Decimal] = {}
         self.done_orders: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self.opened_orders: dict[str, asyncio.Future[dict[str, Any]]] = {}
+        self.canceled_orders: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self.init_market_cache = defaultdict(list)
 
         self.status_bar = tqdm()
@@ -183,11 +184,11 @@ class Overman:
 
     @cached_property
     def logger(self):
-        return logger.setup_logger(self.__class__.__name__ + ':Main', with_root=True)
+        return logger.setup_logger(self.__class__.__name__.lower() + ':main', with_root=True)
 
     @cached_property
     def result_logger(self):
-        return logger.setup_logger(self.__class__.__name__ + ':Result')
+        return logger.setup_logger(self.__class__.__name__.lower() + ':result')
 
     @staticmethod
     def prepare_sub(subs_chunk: tuple[str]):

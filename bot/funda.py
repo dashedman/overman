@@ -578,8 +578,15 @@ class Funda(Overman):
             side: PositionSide,
             price: Decimal | None = None
     ):
-        close_type: Literal['immediate', 'limit'] = 'immediate' if price is None else 'limit'
-        order = await self.create_fut_order(symbol=symbol, side=side, close=close_type, price=price)
+        if price is None:
+            # immediate
+            for try_num in range(10):
+                if try_num > 0:
+                    self.logger.warning('Try %s to close position for %s', try_num, symbol)
+                order = await self.create_fut_order(symbol=symbol, side=side, close='immediate', price=price)
+        else:
+            # limit
+            order = await self.create_fut_order(symbol=symbol, side=side, close='limit', price=price)
         return order['orderId']
 
     async def create_fut_order(
@@ -650,6 +657,30 @@ class Funda(Overman):
 
     @asynccontextmanager
     async def wait_order_opened(self, symbol: str):
+        open_fut = asyncio.Future()
+        self.opened_orders[symbol] = open_fut
+        try:
+            yield open_fut
+            async with asyncio.timeout(60):
+                await open_fut
+        finally:
+            if open_fut is self.opened_orders.get(symbol):
+                del self.opened_orders[symbol]
+
+    @asynccontextmanager
+    async def wait_canceled_opened(self, symbol: str):
+        open_fut = asyncio.Future()
+        self.opened_orders[symbol] = open_fut
+        try:
+            yield open_fut
+            async with asyncio.timeout(60):
+                await open_fut
+        finally:
+            if open_fut is self.opened_orders.get(symbol):
+                del self.opened_orders[symbol]
+
+    @asynccontextmanager
+    async def wait_done_opened(self, symbol: str):
         open_fut = asyncio.Future()
         self.opened_orders[symbol] = open_fut
         try:
