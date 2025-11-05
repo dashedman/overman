@@ -158,7 +158,8 @@ class Funda(Overman):
         super().__init__()
         self.funds_catcher_tasks = dict[str, asyncio.Task]()
 
-        self.positions_futures = dict[str, asyncio.Future[WebsocketMsg]]()
+        self.positions_settle_futures = dict[str, asyncio.Future[WebsocketMsg]]()
+        self.positions_closed_futures = dict[str, asyncio.Future[WebsocketMsg]]()
         self.balance_futures = defaultdict[str, list[asyncio.Future[WebsocketMsg]]](list)
 
         self.need_to_subscribe = deque[str]()
@@ -438,21 +439,18 @@ class Funda(Overman):
         return task
 
     async def process_funding(self, symbol: FutPairInfo, lots_number: int):
-        order_fut = asyncio.Future()
-        funding_fut = asyncio.Future()
 
-        try:
-            is_short = symbol.funding_fee_rate > 0
-            processing_logger = self.logger.getChild(f'Funding:{symbol.symbol}:{'SH' if is_short else 'LG'}')
+        is_short = symbol.funding_fee_rate > 0
+        processing_logger = self.logger.getChild(f'Funding:{symbol.symbol}:{'SH' if is_short else 'LG'}')
 
-            await self.switch_margin_mode(symbol=symbol.symbol, mode='ISOLATED')
-            wait_to_minute = symbol.to_next_settlement.total_seconds() - 10
-            if wait_to_minute < 0:
-                processing_logger.warning('Too late funding: %s', symbol.to_next_settlement)
-                return
-            elif wait_to_minute > 0:
-                processing_logger.info('Sleeping before start: %s sec', wait_to_minute)
-                await asyncio.sleep(wait_to_minute)
+        await self.switch_margin_mode(symbol=symbol.symbol, mode='ISOLATED')
+        wait_to_minute = symbol.to_next_settlement.total_seconds() - 10
+        if wait_to_minute < 0:
+            processing_logger.warning('Too late funding: %s', symbol.to_next_settlement)
+            return
+        elif wait_to_minute > 0:
+            processing_logger.info('Sleeping before start: %s sec', wait_to_minute)
+            await asyncio.sleep(wait_to_minute)
 
             # sym_info_list = []
             # for _ in range(10):
@@ -493,16 +491,17 @@ class Funda(Overman):
             #     # )
             # return
 
-            processing_logger.info(
-                'Starting for %.2f%%, lots: %s',
-                symbol.funding_fee_rate * 100, lots_number
-            )
+        processing_logger.info(
+            'Starting for %.2f%%, lots: %s',
+            symbol.funding_fee_rate * 100, lots_number
+        )
 
-            # create position, x1 to avoid liquidation
-            processing_logger.info('Creating position..')
-            side, opposite_side = (PositionSide.SHORT, PositionSide.LONG) if symbol.funding_fee_rate > 0 else (PositionSide.LONG, PositionSide.SHORT)
+        # create position, x1 to avoid liquidation
+        processing_logger.info('Creating position..')
+        side, opposite_side = (PositionSide.SHORT, PositionSide.LONG) if symbol.funding_fee_rate > 0 else (PositionSide.LONG, PositionSide.SHORT)
 
-            # async with self.wait_order_opened(symbol.symbol):
+
+        async with self.wait_position_settlement(symbol.symbol) as funding_fut:
             opened_order_id = await self.create_position(symbol=symbol.symbol, side=side, size=lots_number)
             processing_logger.info('Created!')
             # opened_order = await self.get_order(opened_order_id)
@@ -529,34 +528,18 @@ class Funda(Overman):
             # profit_order_id = await self.close_position(symbol=symbol.symbol, price=profit_price, side=side)
             #
             # self.done_orders[profit_order_id] = order_fut
-            self.balance_futures[symbol.settle_currency].append(funding_fut)
 
             # wait while fund will be settled or order closed by tp
             processing_logger.info('Waiting for settle..')
-            await asyncio.wait((order_fut, funding_fut), timeout=60, return_when=asyncio.FIRST_COMPLETED)
+            await asyncio.wait((funding_fut,), timeout=60, return_when=asyncio.FIRST_COMPLETED)
 
-            if order_fut.done():
-                # profit order done, do not wait for funds
-                processing_logger.info('Profit order closed!')
-                funding_fut.cancel()
-                return
-
-            elif funding_fut.done():
-
+            if funding_fut.done():
                 processing_logger.info('Funding fee settlement taken!')
             else:
                 self.logger.warning('Settlement timeout')
 
-            # cancel order if need
-            order_fut.cancel()
-            # del self.done_orders[profit_order_id]
-            # await self.cancel_order(profit_order_id)
-
             # close position by market
             await self.close_position(symbol=symbol.symbol, side=side)
-        finally:
-            order_fut.cancel()
-            funding_fut.cancel()
 
     async def create_position(
             self,
@@ -580,10 +563,21 @@ class Funda(Overman):
     ):
         if price is None:
             # immediate
+            last_err = None
             for try_num in range(10):
-                if try_num > 0:
-                    self.logger.warning('Try %s to close position for %s', try_num, symbol)
-                order = await self.create_fut_order(symbol=symbol, side=side, close='immediate', price=price)
+                async with self.wait_position_closed(symbol) as close_fut:
+                    if try_num > 0:
+                        self.logger.warning('Try %s to close position for %s', try_num, symbol)
+                    order = await self.create_fut_order(symbol=symbol, side=side, close='immediate', price=price)
+
+                    try:
+                        await asyncio.wait_for(close_fut, 10)
+                    except TimeoutError as err:
+                        last_err = err
+                        raise err  # TODO remove
+                    break
+            else:
+                raise last_err
         else:
             # limit
             order = await self.create_fut_order(symbol=symbol, side=side, close='limit', price=price)
@@ -656,40 +650,45 @@ class Funda(Overman):
         return data
 
     @asynccontextmanager
-    async def wait_order_opened(self, symbol: str):
+    async def wait_order_opened(self, symbol: str, timeout=60):
         open_fut = asyncio.Future()
         self.opened_orders[symbol] = open_fut
         try:
             yield open_fut
-            async with asyncio.timeout(60):
+            async with asyncio.timeout(timeout):
                 await open_fut
         finally:
             if open_fut is self.opened_orders.get(symbol):
                 del self.opened_orders[symbol]
 
     @asynccontextmanager
-    async def wait_canceled_opened(self, symbol: str):
-        open_fut = asyncio.Future()
-        self.opened_orders[symbol] = open_fut
+    async def wait_position_closed(self, symbol: str, timeout=60):
+        future = asyncio.Future()
+        self.positions_closed_futures[symbol] = future
         try:
-            yield open_fut
-            async with asyncio.timeout(60):
-                await open_fut
+            yield future
+            async with asyncio.timeout(timeout):
+                await future
         finally:
-            if open_fut is self.opened_orders.get(symbol):
-                del self.opened_orders[symbol]
+            if not future.done():
+                future.cancel()
+            if future is self.positions_closed_futures.get(symbol):
+                del self.positions_closed_futures[symbol]
 
     @asynccontextmanager
-    async def wait_done_opened(self, symbol: str):
-        open_fut = asyncio.Future()
-        self.opened_orders[symbol] = open_fut
+    async def wait_position_settlement(self, symbol: str, timeout: float | None = None):
+        future = asyncio.Future()
+        self.positions_settle_futures[symbol] = future
         try:
-            yield open_fut
-            async with asyncio.timeout(60):
-                await open_fut
+            yield future
+            async with asyncio.timeout(timeout):
+                await future
         finally:
-            if open_fut is self.opened_orders.get(symbol):
-                del self.opened_orders[symbol]
+            if not future.done():
+                future.cancel()
+            if future is self.positions_settle_futures.get(symbol):
+                del self.positions_settle_futures[symbol]
+
 
     async def update_fut_balance(self, currency: str | None = None):
         lock = self.get_currency_lock[('FUT', currency)]
@@ -801,7 +800,8 @@ class Funda(Overman):
     async def insure_subscribe_topics(self):
         base_topics = [
             ("/contractMarket/tradeOrders", True, self.process_order_msg),
-            ("/contractAccount/wallet", True, self.process_balance_msg),
+            # ("/contractAccount/wallet", True, self.process_balance_msg),
+            ("/contract/positionAll", True, self.process_position_msg),
         ]
         for base_topic, is_private, callback in base_topics:
             key = (base_topic, is_private)
@@ -887,28 +887,40 @@ class Funda(Overman):
                 pass
             case _:
                 self.logger.warning('Undefined order status: %s', order_status)
-
-    async def process_balance_msg(self, msg):
-        event_data = msg['data']
-        funding_fee = Decimal(event_data['isolatedFundingFeeMargin'])
-        currency = event_data['currency']
-        if funding_fee != 0:
-            self.logger.info('Caught funding balance change! %s: %s', currency, funding_fee)
-            futures = self.balance_futures[currency]
-            for fut in futures:
-                fut.set_result(msg)
-            futures.clear()
-        else:
-            self.logger.info('BALANCE MSG: %s', msg)
-
-
     #
-    # async def process_position_msg(self, position):
-    #     symbol = position['symbol']
-    #     order_status = order['status']
-    #     match order_status:
-    #         case 'done':
-    #             if done_fut := self.done_orders.get(order_id):
-    #                 done_fut.set_result(order)
-    #         case _:
-    #             pass
+    # async def process_balance_msg(self, msg):
+    #     event_data = msg['data']
+    #     funding_fee = Decimal(event_data['isolatedFundingFeeMargin'])
+    #     currency = event_data['currency']
+    #     if funding_fee != 0:
+    #         self.logger.info('Caught funding balance change! %s: %s', currency, funding_fee)
+    #         futures = self.balance_futures[currency]
+    #         for fut in futures:
+    #             fut.set_result(msg)
+    #         futures.clear()
+    #     else:
+    #         self.logger.info('BALANCE MSG: %s', msg)
+
+    async def process_position_msg(self, msg):
+        position = msg['data']
+        subject = msg['subject']
+        symbol = position['symbol']
+        match subject:
+            case 'position.settlement':
+                if fee_fut := self.positions_settle_futures.get(symbol):
+                    fee_fut.set_result(position)
+            case 'position.change':
+                await self.process_position_change(position)
+            case _:
+                pass
+
+    async def process_position_change(self, position):
+        change_reason = position['changeReason']
+        is_open = position['isOpen']
+        symbol = position['symbol']
+
+        match change_reason:
+            case 'positionChange':
+                if not is_open:
+                    if closed_fut := self.positions_closed_futures.get(symbol):
+                        closed_fut.set_result(position)
