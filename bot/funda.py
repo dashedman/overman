@@ -820,7 +820,6 @@ class Funda(Overman):
                 self.topic_router.clear()
                 self.wait_socket.set()
                 try:
-                    last_ping = time.time()
                     await self.insure_subscribe_topics()
                     await self.listen_socket(sock)
             
@@ -831,6 +830,7 @@ class Funda(Overman):
                     self.wait_socket = asyncio.Event()
     
     async def listen_socket(self, sock):
+        last_ping = time.time()
         while True:
             try:
                 try:
