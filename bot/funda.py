@@ -314,7 +314,7 @@ class Funda(Overman):
         profitable_funding = set()
         pos_lost_avg = 0
         for symbol in symbols:
-            position_lost_koef = 0.0025 + 0 * 2 * symbol.taker_fee_rate / (1 - symbol.taker_fee_rate)
+            position_lost_koef = 0.002 + 2 * symbol.taker_fee_rate / (1 - symbol.taker_fee_rate)
             # position_lost_koef *= 0
             pos_lost_avg += position_lost_koef
             if position_lost_koef < abs(symbol.funding_fee_rate):
