@@ -822,7 +822,7 @@ class Funda(Overman):
                 try:
                     last_ping = time.time()
                     await self.insure_subscribe_topics()
-                    await self.listen_socket()
+                    await self.listen_socket(sock)
             
                 except websockets.ConnectionClosed as e:
                     self.logger.error('websocket error: %s', e)
@@ -830,7 +830,7 @@ class Funda(Overman):
                     self.current_sock = None
                     self.wait_socket = asyncio.Event()
     
-    async def listen_socket(self):
+    async def listen_socket(self, sock):
         while True:
             try:
                 try:
