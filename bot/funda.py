@@ -444,7 +444,7 @@ class Funda(Overman):
         processing_logger = self.logger.getChild(f'Funding:{symbol.symbol}:{'SH' if is_short else 'LG'}')
 
         await self.switch_margin_mode(symbol=symbol.symbol, mode='ISOLATED')
-        wait_to_minute = symbol.to_next_settlement.total_seconds() - 10
+        wait_to_minute = symbol.to_next_settlement.total_seconds() - 4
         if wait_to_minute < 0:
             processing_logger.warning('Too late funding: %s', symbol.to_next_settlement)
             return
@@ -534,7 +534,8 @@ class Funda(Overman):
             await asyncio.wait((funding_fut,), timeout=60, return_when=asyncio.FIRST_COMPLETED)
 
             if funding_fut.done():
-                processing_logger.info('Funding fee settlement taken!')
+                funding_res = funding_fut.result()
+                processing_logger.info('Funding fee settlement taken: %s', funding_res.get('posFunding'))
             else:
                 funding_fut.cancel()
                 self.logger.warning('Settlement timeout')
@@ -576,6 +577,8 @@ class Funda(Overman):
                     except TimeoutError as err:
                         last_err = err
                         raise err  # TODO remove
+                    close_res  = close_fut.result()
+                    self.logger.info('Realised PNL %s: %s', symbol, close_res.get('realisedPnl'))
                     break
             else:
                 raise last_err
