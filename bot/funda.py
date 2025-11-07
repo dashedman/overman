@@ -812,55 +812,59 @@ class Funda(Overman):
         for (topic, is_private), callback in self.subscribed_topics.items():
             await self.subscribe_topic(topic, is_private, callback)
 
+    async def manage_socket(self):
+         while True:
+            url = f"wss://ws-api-futures.kucoin.com/?token={await self.private_token()}"
+            async with websockets.connect(url, ping_interval=None) as sock:
+                self.current_sock = sock
+                self.topic_router.clear()
+                self.wait_socket.set()
+                try:
+                    last_ping = time.time()
+                    await self.insure_subscribe_topics()
+                    await self.listen_socket()
+            
+                except websockets.ConnectionClosed as e:
+                    self.logger.error('websocket error: %s', e)
+                finally:
+                    self.current_sock = None
+                    self.wait_socket = asyncio.Event()
+    
+
     async def listen_socket(self):
-        url = f"wss://ws-api-futures.kucoin.com/?token={await self.private_token()}"
-        async for sock in websockets.connect(url, ping_interval=None):
-            self.current_sock = sock
-            self.topic_router.clear()
-            self.wait_socket.set()
+        while True:
             try:
-                last_ping = time.time()
-
-                await self.insure_subscribe_topics()
-
-                while True:
-                    try:
-                        try:
-                            async with asyncio.timeout(self._private_ping_interval * 0.2):
-                                message_raw: str = await sock.recv()
-                        except TimeoutError:
-                            pass
+                try:
+                    async with asyncio.timeout(self._private_ping_interval * 0.2):
+                        message_raw: str = await sock.recv()
+                except TimeoutError:
+                    pass
+                else:
+                    message: dict = orjson.loads(message_raw)
+                    if message.get('code') == 401:
+                        self.logger.info("Token has been expired")
+                        await self.reload_private_token()
+                        self.logger.info("Token reloaded")
+                    else:
+                        if 'data' in message:
+                            asyncio.create_task(self.route_ws_message(message))
                         else:
-                            message: dict = orjson.loads(message_raw)
-                            if message.get('code') == 401:
-                                self.logger.info("Token has been expired")
-                                await self.reload_private_token()
-                                self.logger.info("Token reloaded")
-                            else:
-                                if 'data' in message:
-                                    asyncio.create_task(self.route_ws_message(message))
-                                else:
-                                    pass
+                            pass
 
-                        if last_ping + self._private_ping_interval * 0.8 < time.time():
-                            await sock.send(orjson.dumps({
-                                'id': str(self.next_ws_id()),
-                                'type': 'ping'
-                            }).decode())
-                            last_ping = time.time()
-                    except websockets.ConnectionClosed as e:
-                        self.logger.error('Catch error from websocket: %s', e)
-                        break
-                    except Exception as e:
-                        self.logger.error(
-                            'Catch error while monitoring socket:\n',
-                            exc_info=e)
-                        break
+                if last_ping + self._private_ping_interval * 0.8 < time.time():
+                    await sock.send(orjson.dumps({
+                        'id': str(self.next_ws_id()),
+                        'type': 'ping'
+                    }).decode())
+                    last_ping = time.time()
             except websockets.ConnectionClosed as e:
-                self.logger.error('websocket error: %s', e)
-            finally:
-                self.current_sock = None
-                self.wait_socket = asyncio.Event()
+                self.logger.error('Catch error from websocket: %s', e)
+                break
+            except Exception as e:
+                self.logger.error(
+                    'Catch error while monitoring socket:\n',
+                    exc_info=e)
+                break
 
     async def route_ws_message(self, message: dict[str, Any]):
         topic = message['topic']
