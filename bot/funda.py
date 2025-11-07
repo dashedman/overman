@@ -273,7 +273,7 @@ class Funda(Overman):
 
         async with asyncio.TaskGroup() as tg:
             tg.create_task(self.funding_checker())
-            tg.create_task(self.listen_socket())
+            tg.create_task(self.manage_socket())
 
     def tasks_in_process(self):
         return not all(t.done() for t in self.funds_catcher_tasks.values())
@@ -830,7 +830,6 @@ class Funda(Overman):
                     self.current_sock = None
                     self.wait_socket = asyncio.Event()
     
-
     async def listen_socket(self):
         while True:
             try:
