@@ -314,7 +314,7 @@ class Funda(Overman):
         profitable_funding = set()
         pos_lost_avg = 0
         for symbol in symbols:
-            position_lost_koef = 0.002 + 2 * symbol.taker_fee_rate / (1 - symbol.taker_fee_rate)
+            position_lost_koef = 0.006 + 2 * symbol.taker_fee_rate / (1 - symbol.taker_fee_rate)
             # position_lost_koef *= 0
             pos_lost_avg += position_lost_koef
             if position_lost_koef < abs(symbol.funding_fee_rate):
@@ -360,7 +360,7 @@ class Funda(Overman):
 
         could_be_processed = set()
         for currency, funding_group in grouped_by_currency.items():
-            FUNDING_TASKS = min(3, len(funding_group))
+            FUNDING_TASKS = min(1, len(funding_group))
             funds_for_task = float(
                 self.current_futures_balance.get(currency, 0)
             ) * ACTIVE_FUNDS_RATIO / FUNDING_TASKS
