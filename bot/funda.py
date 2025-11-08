@@ -11,6 +11,8 @@ from typing import Any, Literal, Callable, Awaitable, Iterable
 import cachetools
 import orjson
 import websockets
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 from pydantic import Field
 from tqdm import tqdm
 from typing_extensions import deprecated
@@ -271,18 +273,26 @@ class Funda(Overman):
         await self.update_fut_balance()
         await self.update_spot_balance()
 
-        async with asyncio.TaskGroup() as tg:
-            tg.create_task(self.funding_checker())
-            tg.create_task(self.manage_socket())
+        scheduler = AsyncIOScheduler()
+        check_trigger = CronTrigger(minute=58, second=30)
+        job = scheduler.add_job(self.funding_checker, check_trigger)
+        scheduler.start()
+
+        self.logger.info('First check will be in %s', job.next_run_time)
+
+        await self.manage_socket()
 
     def tasks_in_process(self):
         return not all(t.done() for t in self.funds_catcher_tasks.values())
 
     async def funding_checker(self):
-        while True:
-            if not self.tasks_in_process():
-                await self.check_coming_funding()
-            await asyncio.sleep(3 * 60)
+        # while True:
+        #     if not self.tasks_in_process():
+        #         await self.check_coming_funding()
+        #     await asyncio.sleep(3 * 60)
+
+        if not self.tasks_in_process():
+            await self.check_coming_funding()
 
     async def check_coming_funding(self):
         symbols = await self.get_funding_fee_symbols()
@@ -578,7 +588,11 @@ class Funda(Overman):
                         last_err = err
                         raise err  # TODO remove
                     close_res  = close_fut.result()
-                    self.logger.info('Realised PNL %s: %s', symbol, close_res.get('realisedPnl'))
+                    self.logger.info(
+                        'Realised PNL %s: %s, gross: %s, fund: %s',
+                        symbol, close_res.get('realisedPnl'), close_res.get('realisedGrossPnl'),
+                        close_res.get('posFunding')
+                    )
                     break
             else:
                 raise last_err
