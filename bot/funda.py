@@ -444,7 +444,7 @@ class Funda(Overman):
         processing_logger = self.logger.getChild(f'Funding:{symbol.symbol}:{'SH' if is_short else 'LG'}')
 
         await self.switch_margin_mode(symbol=symbol.symbol, mode='ISOLATED')
-        wait_to_minute = symbol.to_next_settlement.total_seconds() - 4
+        wait_to_minute = symbol.to_next_settlement.total_seconds() - 9
         if wait_to_minute < 0:
             processing_logger.warning('Too late funding: %s', symbol.to_next_settlement)
             return
