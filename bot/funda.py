@@ -3,7 +3,7 @@ import math
 import time
 from collections import deque, defaultdict, Counter
 from contextlib import asynccontextmanager
-from datetime import timedelta
+from datetime import timedelta, datetime, UTC
 from decimal import Decimal
 from enum import Enum
 from typing import Any, Literal, Callable, Awaitable, Iterable
@@ -141,6 +141,10 @@ class FutPairInfo(PairInfo):
     @property
     def to_next_settlement(self):
         return timedelta(milliseconds=self.next_funding_rate_time)
+        
+    @property
+    def next_settlement_at(self):
+        return datetime.fromtimestamp(self.next_funding_rate_date_time)
 
     @property
     def minimal_size(self):
@@ -454,7 +458,7 @@ class Funda(Overman):
         processing_logger = self.logger.getChild(f'Funding:{symbol.symbol}:{'SH' if is_short else 'LG'}')
 
         await self.switch_margin_mode(symbol=symbol.symbol, mode='ISOLATED')
-        wait_to_minute = symbol.to_next_settlement.total_seconds() - 9
+        wait_to_minute = (symbol.next_settlement_at - datetime.now(UTC)).total_seconds() - 5
         if wait_to_minute < 0:
             processing_logger.warning('Too late funding: %s', symbol.to_next_settlement)
             return
