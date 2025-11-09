@@ -144,7 +144,7 @@ class FutPairInfo(PairInfo):
         
     @property
     def next_settlement_at(self):
-        return datetime.fromtimestamp(self.next_funding_rate_date_time / 1000)
+        return datetime.fromtimestamp(self.next_funding_rate_date_time / 1000, UTC)
 
     @property
     def minimal_size(self):
