@@ -373,11 +373,14 @@ class Funda(Overman):
             grouped_by_currency[sym.settle_currency].add(sym)
 
         could_be_processed = set()
+        FUNDING_TASKS = 1
+        funds_for_currency = dict[str, float]()
         for currency, funding_group in grouped_by_currency.items():
-            FUNDING_TASKS = min(1, len(funding_group))
+            funding_group_task = min(FUNDING_TASKS, len(funding_group))
             funds_for_task = float(
                 self.current_futures_balance.get(currency, 0)
-            ) * ACTIVE_FUNDS_RATIO / FUNDING_TASKS
+            ) * ACTIVE_FUNDS_RATIO / funding_group_task
+            funds_for_currency[currency] = funds_for_task
 
             for sym in funding_group:
                 # print(sym.symbol, sym.index_price * sym.minimal_size, funds_for_task)
@@ -394,56 +397,56 @@ class Funda(Overman):
                             'Not enough funds of currency %s! (need %s, have: %s)',
                             currency, need_funds, funds_for_task,
                         )
-            self.logger.info('Could be processed symbols: %s', len(could_be_processed))
+        self.logger.info('Could be processed symbols: %s', len(could_be_processed))
 
-            all_in_one = sort_by_profit(could_be_processed)
-            self.logger.info('All in one: %s', len(all_in_one))
+        all_in_one = sort_by_profit(could_be_processed)
+        self.logger.info('All in one: %s', len(all_in_one))
 
-            if nearest_window > timedelta(minutes=7):
-                self.logger.info(
-                    'Nearest window will be in %s: %s',
-                    nearest_window,
-                    ', '.join(
-                        f'{s.funding_fee_rate * 100:.2f}%: {s.symbol}'
-                        for s in all_in_one[:FUNDING_TASKS]
-                    ) or 'X'
+        if nearest_window > timedelta(minutes=7):
+            self.logger.info(
+                'Nearest window will be in %s: %s',
+                nearest_window,
+                ', '.join(
+                    f'{s.funding_fee_rate * 100:.2f}%: {s.symbol}'
+                    for s in all_in_one[:FUNDING_TASKS]
+                ) or 'X'
+            )
+            return
+
+        tasks = []
+        to_process = all_in_one[:FUNDING_TASKS]
+        for sym in to_process:
+            size_of_currency = float(funds_for_currency[sym.settle_currency]) / sym.index_price
+            lots_number = max(1, int(size_of_currency / sym.minimal_size))
+            # lots_number = 1
+            task = self.start_funding_process(symbol=sym, lots_number=lots_number)
+            tasks.append(task)
+
+        if tasks:
+            old_balance = self.current_futures_balance.copy()
+            result = await asyncio.gather(*tasks, return_exceptions=True)
+
+            for idx, res in enumerate(result):
+                if isinstance(res, BaseException):
+                    self.logger.error('Caught for %s: ', to_process[idx].symbol, exc_info=res)
+            await self.update_fut_balance()
+            await self.update_spot_balance()
+
+            # print balance diff
+            curr_keys = set(self.current_futures_balance) | set(old_balance)
+            balance_diff = {
+                curr: (
+                    self.current_futures_balance.get(curr, 0),
+                    self.current_futures_balance.get(curr, 0) - old_balance.get(curr, 0),
                 )
-                return
-
-            tasks = []
-            to_process = all_in_one[:FUNDING_TASKS]
-            for sym in to_process:
-                size_of_currency = float(funds_for_task) / sym.index_price
-                lots_number = max(1, int(size_of_currency / sym.minimal_size))
-                # lots_number = 1
-                task = self.start_funding_process(symbol=sym, lots_number=lots_number)
-                tasks.append(task)
-
-            if tasks:
-                old_balance = self.current_futures_balance.copy()
-                result = await asyncio.gather(*tasks, return_exceptions=True)
-
-                for idx, res in enumerate(result):
-                    if isinstance(res, BaseException):
-                        self.logger.error('Caught for %s: ', to_process[idx].symbol, exc_info=res)
-                await self.update_fut_balance()
-                await self.update_spot_balance()
-
-                # print balance diff
-                curr_keys = set(self.current_futures_balance) | set(old_balance)
-                balance_diff = {
-                    curr: (
-                        self.current_futures_balance.get(curr, 0),
-                        self.current_futures_balance.get(curr, 0) - old_balance.get(curr, 0),
-                    )
-                    for curr in curr_keys
-                    if self.current_futures_balance.get(curr, 0) > 0 and
-                       self.current_futures_balance.get(curr, 0) - old_balance.get(curr, 0) != 0
-                }
-                self.result_logger.info('%s', ', '.join(
-                    f'{curr}: {balance:.3f} ({diff:.3f})'
-                    for curr, (balance, diff) in sorted(balance_diff.items(), key=lambda kv: abs(kv[1][1]))
-                ))
+                for curr in curr_keys
+                if self.current_futures_balance.get(curr, 0) > 0 and
+                   self.current_futures_balance.get(curr, 0) - old_balance.get(curr, 0) != 0
+            }
+            self.result_logger.info('%s', ', '.join(
+                f'{curr}: {balance:.3f} ({diff:.3f})'
+                for curr, (balance, diff) in sorted(balance_diff.items(), key=lambda kv: abs(kv[1][1]))
+            ))
 
 
     def start_funding_process(self, symbol: FutPairInfo, lots_number: int):
