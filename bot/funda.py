@@ -277,10 +277,12 @@ class Funda(Overman):
         await self.update_fut_balance()
         await self.update_spot_balance()
 
-        scheduler = AsyncIOScheduler()
-        check_trigger = CronTrigger(minute=58, second=30)
-        job = scheduler.add_job(self.funding_checker, check_trigger)
-        scheduler.start()
+        # scheduler = AsyncIOScheduler()
+        # check_trigger = CronTrigger(minute=58, second=30)
+        # job = scheduler.add_job(self.funding_checker, check_trigger)
+        # scheduler.start()
+
+        await self.funding_checker()
 
         self.logger.info('First check will be in %s', job.next_run_time)
 
@@ -328,7 +330,7 @@ class Funda(Overman):
         profitable_funding = set()
         pos_lost_avg = 0
         for symbol in symbols:
-            position_lost_koef = 0.006 + 2 * symbol.taker_fee_rate / (1 - symbol.taker_fee_rate)
+            position_lost_koef = 0.003 + 2 * symbol.taker_fee_rate / (1 - symbol.taker_fee_rate)
             # position_lost_koef *= 0
             pos_lost_avg += position_lost_koef
             if position_lost_koef < abs(symbol.funding_fee_rate):
@@ -363,7 +365,8 @@ class Funda(Overman):
             }
         )
 
-        profitable_in_window = nearest_window_funding & profitable_funding
+        # profitable_in_window = nearest_window_funding & profitable_funding
+        profitable_in_window = profitable_funding
         self.logger.info('Profitable in window: %s', len(profitable_in_window))
 
         ACTIVE_FUNDS_RATIO = 0.9
@@ -373,34 +376,77 @@ class Funda(Overman):
             grouped_by_currency[sym.settle_currency].add(sym)
 
         could_be_processed = set()
-        FUNDING_TASKS = 1
         funds_for_currency = dict[str, float]()
         for currency, funding_group in grouped_by_currency.items():
-            funding_group_task = min(FUNDING_TASKS, len(funding_group))
-            funds_for_task = float(
+            funds_for_task_group = float(
                 self.current_futures_balance.get(currency, 0)
-            ) * ACTIVE_FUNDS_RATIO / funding_group_task
-            funds_for_currency[currency] = funds_for_task
+            ) * ACTIVE_FUNDS_RATIO
+            funds_for_currency[currency] = funds_for_task_group
 
-            for sym in funding_group:
+            lots_wasting_stat_by_sym = {}
+            MAX_LOTS = 10
+
+            def lots_calculator(pairs: list[tuple[float, float]]):
+                lots_wasted_stat = []
+                for lots_num in range(1, MAX_LOTS + 1):
+                    # need short
+                    lots_cost = 0
+                    need_lots = lots_num
+                    for price, lots_available in pairs:
+                        if need_lots <= 0:
+                            break
+
+                        if lots_available >= need_lots:
+                            lots_cost += price * need_lots
+                            need_lots = 0
+                        else:
+                            lots_cost += price * lots_available
+                            need_lots -= lots_available
+                    else:
+                        # not enough lots in orderbook to cover
+                        break
+                    lots_wasted_stat.append(lots_cost)
+                return lots_wasted_stat
+
+            for sym in sort_by_profit(funding_group):
+                order_book = await self.get_order_book(symbol=sym.symbol)
+                # convert sizes to lots
+                asks = [(price * sym.minimal_size, size // sym.minimal_size) for price, size in order_book['asks']]
+                bids = [(price * sym.minimal_size, size // sym.minimal_size) for price, size in order_book['bids']]
+
+                lots_from_asks = lots_calculator(asks)
+                lots_from_bids = lots_calculator(bids)
+
+                lots_full_cycle_cost = [
+                    -ask + bid
+                    for ask, bid in zip(lots_from_asks, lots_from_bids)
+                ]
+                lots_input_cost = (lots_from_asks if sym.funding_fee_rate < 0 else lots_from_bids).copy()
+                self.logger.info('%s Lots cost (index: %s, index lot: %s):', sym.symbol, sym.index_price, sym.index_price * sym.minimal_size)
+                for lot, (lot_cost, lot_input) in enumerate(zip(lots_full_cycle_cost, lots_input_cost), start=1):
+                    self.logger.info('\t%s: %.5f %s', lot, lot_cost, lot_input)
+
+                funds_for_task_group
+
                 # print(sym.symbol, sym.index_price * sym.minimal_size, funds_for_task)
-                need_funds = sym.index_price * sym.minimal_size
-                if need_funds < funds_for_task:
-                    could_be_processed.add(sym)
-                else:
-                    self.logger.warning(
-                        'Not enough funds of currency %s! (need %s, have: %s)',
-                        currency, need_funds, funds_for_task
-                    )
-                    if currency != 'USDT':
-                        self.result_logger.warning(
-                            'Not enough funds of currency %s! (need %s, have: %s)',
-                            currency, need_funds, funds_for_task,
-                        )
+                # need_funds = sym.index_price * sym.minimal_size
+                # if need_funds < funds_for_task_group:
+                #     could_be_processed.add(sym)
+                # else:
+                #     self.logger.warning(
+                #         'Not enough funds of currency %s! (need %s, have: %s)',
+                #         currency, need_funds, funds_for_task
+                #     )
+                #     if currency != 'USDT':
+                #         self.result_logger.warning(
+                #             'Not enough funds of currency %s! (need %s, have: %s)',
+                #             currency, need_funds, funds_for_task,
+                #         )
         self.logger.info('Could be processed symbols: %s', len(could_be_processed))
 
         all_in_one = sort_by_profit(could_be_processed)
         self.logger.info('All in one: %s', len(all_in_one))
+        return
 
         if nearest_window > timedelta(minutes=7):
             self.logger.info(
@@ -516,7 +562,6 @@ class Funda(Overman):
         # create position, x1 to avoid liquidation
         processing_logger.info('Creating position..')
         side, opposite_side = (PositionSide.SHORT, PositionSide.LONG) if symbol.funding_fee_rate > 0 else (PositionSide.LONG, PositionSide.SHORT)
-
 
         async with self.wait_position_settlement(symbol.symbol) as funding_fut:
             opened_order_id = await self.create_position(symbol=symbol.symbol, side=side, size=lots_number)
@@ -671,6 +716,15 @@ class Funda(Overman):
             'GET',
             endpoint,
             private=True,
+        )
+        return data
+
+    async def get_order_book(self, symbol: str, size: Literal[20, 100] = 20):
+        endpoint = f'/api/v1/level2/depth{size}'
+        data = await self.do_fut_request(
+            'GET',
+            endpoint,
+            params={'symbol': symbol}
         )
         return data
 
